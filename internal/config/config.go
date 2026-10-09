@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -33,23 +35,35 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 
-	return config, err
+	return config, nil
 }
 
 func (c Config) Validate() error {
 	if c.Interval == "" {
 		return fmt.Errorf("interval is required")
 	}
+
+	interval, err := time.ParseDuration(c.Interval)
+	if err != nil {
+		return fmt.Errorf("invalid interval %q: %w", c.Interval, err)
+	}
+
+	if interval <= 0 {
+		return fmt.Errorf("interval must be greater than zero")
+	}
+
 	if len(c.Repositories) == 0 {
 		return fmt.Errorf("at least one repository is required")
 	}
+
 	for _, repository := range c.Repositories {
-		if repository.Path == "" {
+		if strings.TrimSpace(repository.Path) == "" {
+
 			return fmt.Errorf("repository path is required")
 		}
 	}
 
-	if c.Commit.Message == "" {
+	if strings.TrimSpace(c.Commit.Message) == "" {
 		return fmt.Errorf("commit message is required")
 	}
 

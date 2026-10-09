@@ -75,3 +75,182 @@ repositories:
 		t.Fatal("expected an error, got nil")
 	}
 }
+
+func TestValidateMissingInterval(t *testing.T) {
+	config := Config{
+		Interval: "",
+		Repositories: []Repository{
+			{Path: "/home/gamp/project1"},
+		},
+		Commit: CommitConfig{
+			Message: "Auto backup",
+		},
+	}
+
+	err := config.Validate()
+
+	if err == nil {
+		t.Fatal("expected an error for missing interval, got nil")
+	}
+}
+
+func TestValidateMissingRepositories(t *testing.T) {
+	config := Config{
+		Interval:     "1h",
+		Repositories: []Repository{},
+		Commit: CommitConfig{
+			Message: "Auto backup",
+		},
+	}
+
+	err := config.Validate()
+
+	if err == nil {
+		t.Fatal("expected an error for missing repositories, got nil")
+	}
+}
+
+func TestValidateMissingRepositoryPath(t *testing.T) {
+	config := Config{
+		Interval: "1h",
+		Repositories: []Repository{
+			{Path: ""},
+		},
+		Commit: CommitConfig{
+			Message: "Auto backup",
+		},
+	}
+
+	err := config.Validate()
+
+	if err == nil {
+		t.Fatal("expected an error for an empty repository path, got nil")
+	}
+}
+
+func TestValidateMissingCommitMessage(t *testing.T) {
+	config := Config{
+		Interval: "1h",
+		Repositories: []Repository{
+			{Path: "/home/gamp/project1"},
+		},
+		Commit: CommitConfig{
+			Message: "",
+		},
+	}
+
+	err := config.Validate()
+
+	if err == nil {
+		t.Fatal("expected an error for missing commit message, got nil")
+	}
+}
+
+func TestValidateValidConfig(t *testing.T) {
+	config := Config{
+		Interval: "1h",
+		Repositories: []Repository{
+			{Path: "/home/gamp/project1"},
+			{Path: "/home/gamp/project2"},
+		},
+		Commit: CommitConfig{
+			Message: "Auto backup",
+		},
+	}
+
+	err := config.Validate()
+
+	if err != nil {
+		t.Fatalf("expected valid configuration, got error: %v", err)
+	}
+}
+
+func TestValidateInvalidInterval(t *testing.T) {
+	config := Config{
+		Interval: "banana",
+		Repositories: []Repository{
+			{Path: "/home/gamp/project1"},
+		},
+		Commit: CommitConfig{
+			Message: "Auto backup",
+		},
+	}
+
+	err := config.Validate()
+
+	if err == nil {
+		t.Fatal("expected an error for invalid interval, got nil")
+	}
+}
+
+func TestValidateZeroInterval(t *testing.T) {
+	config := Config{
+		Interval: "0s",
+		Repositories: []Repository{
+			{Path: "/home/gamp/project1"},
+		},
+		Commit: CommitConfig{
+			Message: "Auto backup",
+		},
+	}
+
+	err := config.Validate()
+
+	if err == nil {
+		t.Fatal("expected an error for zero interval, got nil")
+	}
+}
+
+func TestValidateNegativeInterval(t *testing.T) {
+	config := Config{
+		Interval: "-1h",
+		Repositories: []Repository{
+			{Path: "/home/gamp/project1"},
+		},
+		Commit: CommitConfig{
+			Message: "Auto backup",
+		},
+	}
+
+	err := config.Validate()
+
+	if err == nil {
+		t.Fatal("expected an error for negative interval, got nil")
+	}
+}
+
+func TestValidateWhitespaceRepositoryPath(t *testing.T) {
+	config := Config{
+		Interval: "1h",
+		Repositories: []Repository{
+			{Path: "   "},
+		},
+		Commit: CommitConfig{
+			Message: "Auto backup",
+		},
+	}
+
+	err := config.Validate()
+
+	if err == nil {
+		t.Fatal("expected an error for whitespace-only repository path, got nil")
+	}
+}
+
+func TestValidateWhitespaceCommitMessage(t *testing.T) {
+	config := Config{
+		Interval: "1h",
+		Repositories: []Repository{
+			{Path: "/home/gamp/project1"},
+		},
+		Commit: CommitConfig{
+			Message: "   ",
+		},
+	}
+
+	err := config.Validate()
+
+	if err == nil {
+		t.Fatal("expected an error for whitespace-only commit message, got nil")
+	}
+}
