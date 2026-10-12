@@ -1,0 +1,17 @@
+interval: "1m"
+
+repositories:
+  - path: "/home/bishop/GolandProjects/Lets-GO"
+
+commit:
+  message: "chore: automatic backup"
+
+editors:
+  - goland
+  - pycharm
+  - code
+  - codium
+  - nvim
+  - vim
+  - zed
+  - cursor

@@ -44,7 +44,11 @@ func TestHasChanges(t *testing.T) {
 	}
 
 	// A newly initialized repository should be clean.
-	if HasChanges(tempDir) {
+	hasChanges, err := HasChanges(tempDir)
+	if err != nil {
+		t.Fatalf("HasChanges() failed: %v", err)
+	}
+	if hasChanges {
 		t.Error("expected new repository to have no changes")
 	}
 
@@ -56,7 +60,11 @@ func TestHasChanges(t *testing.T) {
 	}
 
 	// The untracked file should be detected.
-	if !HasChanges(tempDir) {
+	hasChanges, err = HasChanges(tempDir)
+	if err != nil {
+		t.Fatalf("HasChanges() failed: %v", err)
+	}
+	if !hasChanges {
 		t.Error("expected repository to have changes after creating a file")
 	}
 }
@@ -373,7 +381,11 @@ func TestBackupNoChanges(t *testing.T) {
 	}
 
 	// The repository is now clean.
-	if HasChanges(localPath) {
+	hasChanges, err := HasChanges(localPath)
+	if err != nil {
+		t.Fatalf("HasChanges() failed: %v", err)
+	}
+	if hasChanges {
 		t.Fatal("expected repository to be clean")
 	}
 
@@ -397,5 +409,95 @@ func TestBackupNoChanges(t *testing.T) {
 
 	if string(output) != expected {
 		t.Errorf("expected no new commit, got:\n%s", output)
+	}
+}
+
+func TestBackupRetriesPushAfterFailure(t *testing.T) {
+	tempDir := t.TempDir()
+
+	remotePath := filepath.Join(tempDir, "remote.git")
+	localPath := filepath.Join(tempDir, "local")
+	missingRemotePath := filepath.Join(tempDir, "missing-remote.git")
+
+	// Create a bare repository to act as the remote.
+	cmd := exec.Command("git", "init", "--bare", remotePath)
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create the local repository.
+	if err := os.Mkdir(localPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd = exec.Command("git", "-C", localPath, "init")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Configure Git identity.
+	for key, value := range map[string]string{
+		"user.name":  "AutoGit Test",
+		"user.email": "autogit-test@example.com",
+	} {
+		cmd = exec.Command("git", "-C", localPath, "config", key, value)
+		if err := cmd.Run(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Configure a remote that does not exist yet.
+	cmd = exec.Command(
+		"git", "-C", localPath,
+		"remote", "add", "origin", missingRemotePath,
+	)
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a change to back up.
+	filePath := filepath.Join(localPath, "test.txt")
+	if err := os.WriteFile(filePath, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The commit should succeed, but the push should fail.
+	if err := Backup(localPath, "retry push test"); err == nil {
+		t.Fatal("expected backup to fail when the remote is missing")
+	}
+
+	// Repair the remote without changing the local commit.
+	cmd = exec.Command(
+		"git", "-C", localPath,
+		"remote", "set-url", "origin", remotePath,
+	)
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Retry the backup with no new file changes.
+	if err := Backup(localPath, "retry push test"); err != nil {
+		t.Fatalf("expected backup to retry the push, got: %v", err)
+	}
+
+	// Verify that the remote received the existing commit.
+	cmd = exec.Command("git", "--git-dir", remotePath, "show-ref")
+	if err := cmd.Run(); err != nil {
+		t.Fatal("expected the retry to push the existing commit")
+	}
+}
+
+func TestHasChangesInvalidRepository(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// This directory is not a Git repository.
+	hasChanges, err := HasChanges(tempDir)
+
+	if err == nil {
+		t.Fatal("expected an error when checking a non-Git directory")
+	}
+
+	if hasChanges {
+		t.Error("expected hasChanges to be false when Git status fails")
 	}
 }

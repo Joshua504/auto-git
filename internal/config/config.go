@@ -13,6 +13,7 @@ type Config struct {
 	Interval     string       `yaml:"interval"`
 	Repositories []Repository `yaml:"repositories"`
 	Commit       CommitConfig `yaml:"commit"`
+	Editors      []string     `yaml:"editors"`
 }
 
 type Repository struct {
