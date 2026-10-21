@@ -79,9 +79,12 @@ func monitorEditors(ctx context.Context, editors []string, s *scheduler.Schedule
 			stop = make(chan struct{})
 			done = make(chan struct{})
 
+			currentStop := stop
+			currentDone := done
+
 			go func() {
-				defer close(done)
-				s.Start(stop)
+				defer close(currentDone)
+				s.Start(currentStop)
 			}()
 
 			log.Println("A configured editor is open. AutoGit backups enabled.")
