@@ -43,23 +43,27 @@ func Commit(path, message string) error {
 }
 
 func Push(path string) error {
-	cmd := exec.Command("git", "-C", path, "push", "-u", "origin", "HEAD")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git push failed: %w: %s", err, output)
-	}
+	return retry("git push", isRetryableGitError, func() error {
+		cmd := exec.Command("git", "-C", path, "push", "-u", "origin", "HEAD")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("git push failed: %w: %s", err, output)
+		}
 
-	return nil
+		return nil
+	})
 }
 
 func Fetch(path string) error {
-	cmd := exec.Command("git", "-C", path, "fetch", "origin")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git fetch failed: %w: %s", err, output)
-	}
+	return retry("git fetch", isRetryableGitError, func() error {
+		cmd := exec.Command("git", "-C", path, "fetch", "origin")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("git fetch failed: %w: %s", err, output)
+		}
 
-	return nil
+		return nil
+	})
 }
 
 func IsBehindRemote(path string) (bool, error) {

@@ -2,6 +2,7 @@ interval: "1m"
 
 repositories:
   - path: "/home/bishop/GolandProjects/Lets-GO"
+  - path: "/home/bishop/PycharmProjects/Python_Block"
 
 commit:
   message: "chore: automatic backup"
