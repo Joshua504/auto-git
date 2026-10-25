@@ -1,0 +1,32 @@
+# AutoGit configuration.
+#
+# Copy this file to config.yaml and edit the copy:
+#
+#   cp config.example.yaml config.yaml
+#
+# AutoGit looks for config.yaml in the current directory, then in
+# ~/.config/autogit/config.yaml. To use another file, run:
+#
+#   autogit --config /path/to/config.yaml
+
+# How often to check the repositories while an editor is open.
+interval: "1m"
+
+# Absolute paths of the Git repositories to back up.
+repositories:
+  - path: "/path/to/your/repository"
+
+commit:
+  message: "chore: automatic backup"
+
+# Process names that mean "an editor is open". Each must match what
+# `pgrep -x <name>` finds on your system.
+editors:
+  - goland
+  - pycharm
+  - code
+  - codium
+  - nvim
+  - vim
+  - zed
+  - cursor

@@ -1,0 +1,16 @@
+# Personal AutoGit configuration. Create it with: cp config.example.yaml config.yaml
+/config.yaml
+
+# IDE and editor files
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# Build output and test binaries (anchored so cmd/autogit/ is not ignored)
+/autogit
+*.test
+*.out
+
+# OS files
+.DS_Store

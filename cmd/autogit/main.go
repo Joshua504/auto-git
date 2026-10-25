@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -16,9 +19,18 @@ import (
 )
 
 func main() {
-	cfg, err := config.Load("config.yaml")
+	configFlag := flag.String("config", "",
+		"path to the configuration file (default: ./config.yaml, then ~/.config/autogit/config.yaml)")
+	flag.Parse()
+
+	configPath, err := config.Locate(*configFlag)
 	if err != nil {
-		log.Fatalf("Error loading configuration: %v", err)
+		log.Fatalf("Error locating configuration: %v", err)
+	}
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		log.Fatalf("Error loading configuration %s: %v", configPath, err)
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -35,6 +47,13 @@ func main() {
 			log.Printf("Checking repository: %s", repository.Path)
 
 			if err := git.Backup(repository.Path, cfg.Commit.Message); err != nil {
+				// A busy repository is not a failure; the next cycle tries again.
+				var skipped *git.SkippedError
+				if errors.As(err, &skipped) {
+					log.Printf("Skipping %s: %s", repository.Path, skipped.Reason)
+					continue
+				}
+
 				log.Printf("Backup failed for %s: %v", repository.Path, err)
 				continue
 			}
@@ -55,56 +74,99 @@ func main() {
 	)
 	defer cancel()
 
+	// Show which file was used, since there is more than one place it can come from.
+	displayPath, err := filepath.Abs(configPath)
+	if err != nil {
+		displayPath = configPath
+	}
+
 	fmt.Println("AutoGit configuration loaded successfully.")
+	fmt.Printf("Configuration file: %s\n", displayPath)
 	fmt.Printf("Backup interval: %s\n", cfg.Interval)
 	fmt.Printf("Repositories configured: %d\n", len(cfg.Repositories))
 	fmt.Printf("Editors monitored: %v\n", cfg.Editors)
 	fmt.Println("AutoGit is waiting for a configured editor to open.")
 
-	monitorEditors(ctx, cfg.Editors, s)
+	w := &watcher{
+		isRunning: func() bool { return editor.IsRunning(cfg.Editors) },
+		pollEvery: editorPollInterval,
+		scheduler: s,
+		backup:    backupTask,
+	}
+
+	w.run(ctx)
 	fmt.Println("AutoGit stopped.")
 }
 
-func monitorEditors(ctx context.Context, editors []string, s *scheduler.Scheduler) {
-	checkInterval := time.NewTicker(5 * time.Second)
-	defer checkInterval.Stop()
+// editorPollInterval is how often AutoGit checks whether an editor is open.
+const editorPollInterval = 5 * time.Second
 
-	var stop chan struct{}
-	var done chan struct{}
+// watcher turns "an editor is open" into running backups.
+//
+// While an editor is open it backs up immediately and then on every scheduler
+// tick. When the last editor closes it runs one final backup, so the edits
+// made just before closing are not left uncommitted until the next session.
+type watcher struct {
+	isRunning func() bool          // reports whether a configured editor is open
+	pollEvery time.Duration        // how often to call isRunning
+	scheduler *scheduler.Scheduler // runs backup periodically while an editor is open
+	backup    func()               // one backup pass over every configured repository
+}
+
+// run blocks until ctx is cancelled.
+//
+// Backups never overlap: the opening backup and the scheduled ones run on one
+// goroutine, and the closing backup starts only after that goroutine has
+// finished.
+//
+// Shutting AutoGit down (Ctrl+C, SIGTERM) deliberately skips the final backup,
+// so that stopping the program stays quick.
+func (w *watcher) run(ctx context.Context) {
+	poll := time.NewTicker(w.pollEvery)
+	defer poll.Stop()
+
+	var stop, done chan struct{}
 
 	for {
-		running := editor.IsRunning(editors)
+		running := w.isRunning()
 
-		if running && stop == nil {
+		switch {
+		case running && stop == nil:
 			stop = make(chan struct{})
 			done = make(chan struct{})
 
-			currentStop := stop
-			currentDone := done
+			go func(stop <-chan struct{}, done chan<- struct{}) {
+				defer close(done)
 
-			go func() {
-				defer close(currentDone)
-				s.Start(currentStop)
-			}()
+				// Catch up on anything that changed while no editor was open,
+				// instead of waiting a full interval for the first backup.
+				w.backup()
+
+				w.scheduler.Start(stop)
+			}(stop, done)
 
 			log.Println("A configured editor is open. AutoGit backups enabled.")
-		} else if !running && stop != nil {
+
+		case !running && stop != nil:
 			close(stop)
 			<-done
 
 			stop = nil
 			done = nil
 
-			log.Println("No configured editors are open. AutoGit backups paused.")
+			log.Println("No configured editors are open. Running a final backup.")
+			w.backup()
+			log.Println("AutoGit backups paused.")
 		}
 
 		select {
-		case <-checkInterval.C:
+		case <-poll.C:
 		case <-ctx.Done():
 			if stop != nil {
 				close(stop)
 				<-done
 			}
+
 			return
 		}
 	}
