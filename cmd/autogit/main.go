@@ -42,11 +42,17 @@ func main() {
 		log.Fatalf("Error parsing backup interval: %v", err)
 	}
 
+	backupOptions := git.Options{
+		Mode:    cfg.Backup.Mode,
+		Prefix:  cfg.Backup.Prefix,
+		Machine: cfg.Backup.Machine,
+	}
+
 	backupTask := func() {
 		for _, repository := range cfg.Repositories {
 			log.Printf("Checking repository: %s", repository.Path)
 
-			if err := git.Backup(repository.Path, cfg.Commit.Message); err != nil {
+			if err := git.BackupWith(repository.Path, cfg.Commit.Message, backupOptions); err != nil {
 				// A busy repository is not a failure; the next cycle tries again.
 				var skipped *git.SkippedError
 				if errors.As(err, &skipped) {
@@ -83,6 +89,13 @@ func main() {
 	fmt.Println("AutoGit configuration loaded successfully.")
 	fmt.Printf("Configuration file: %s\n", displayPath)
 	fmt.Printf("Backup interval: %s\n", cfg.Interval)
+
+	backupMode := cfg.Backup.Mode
+	if backupMode == "" {
+		backupMode = git.ModeCommit
+	}
+
+	fmt.Printf("Backup mode: %s\n", backupMode)
 	fmt.Printf("Repositories configured: %d\n", len(cfg.Repositories))
 	fmt.Printf("Editors monitored: %v\n", cfg.Editors)
 	fmt.Println("AutoGit is waiting for a configured editor to open.")

@@ -202,7 +202,50 @@ func Pull(path string) error {
 	return nil
 }
 
+// Backup modes, selected with Options.Mode.
+const (
+	// ModeCommit commits to the branch you are working on. This is the default.
+	ModeCommit = "commit"
+
+	// ModeBranch leaves your branch, index and working tree alone and keeps
+	// snapshots of your work on a separate backup branch instead.
+	ModeBranch = "branch"
+)
+
+// Options chooses how a repository is backed up.
+type Options struct {
+	// Mode is ModeCommit (the default when empty) or ModeBranch.
+	Mode string
+
+	// Prefix is the namespace of backup branches in ModeBranch. The default is
+	// "autogit", which gives branches like autogit/<machine>/<branch>.
+	Prefix string
+
+	// Machine names this computer in the backup branch name, so two computers
+	// never write to the same branch. The default is the host name.
+	Machine string
+}
+
+// Backup backs up a repository in the default mode, ModeCommit.
 func Backup(path, message string) error {
+	return BackupWith(path, message, Options{})
+}
+
+// BackupWith backs up a repository using the given options.
+func BackupWith(path, message string, opts Options) error {
+	switch opts.Mode {
+	case "", ModeCommit:
+		return backupCommit(path, message)
+	case ModeBranch:
+		return backupBranch(path, message, opts)
+	default:
+		return fmt.Errorf("unknown backup mode %q (use %q or %q)", opts.Mode, ModeCommit, ModeBranch)
+	}
+}
+
+// backupCommit commits changes on the current branch, brings in remote
+// changes, and pushes.
+func backupCommit(path, message string) error {
 	if !IsRepository(path) {
 		return fmt.Errorf("%s is not a Git repository", path)
 	}
@@ -234,7 +277,7 @@ func Backup(path, message string) error {
 		}
 
 		// Keep secrets, key files and oversized files out of the commit.
-		blocked, err := guardStaged(path)
+		blocked, err := guardStaged(path, nil)
 		if err != nil {
 			return skipIfLocked(fmt.Errorf("checking staged files for secrets: %w", err))
 		}

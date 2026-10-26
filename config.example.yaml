@@ -19,6 +19,18 @@ repositories:
 commit:
   message: "chore: automatic backup"
 
+# How your work is protected.
+#
+#   branch  Keeps snapshots on a separate branch named autogit/<machine>/<branch>.
+#           Your own branch, staged files and working tree are never touched, so
+#           there are no automatic commits in your history. Recommended.
+#   commit  Commits to the branch you are working on and pushes it. This is the
+#           default when the backup section is left out.
+backup:
+  mode: "branch"
+  # prefix: "autogit"          # namespace of the backup branches
+  # machine: "my-laptop"       # defaults to this computer's host name
+
 # Process names that mean "an editor is open". Each must match what
 # `pgrep -x <name>` finds on your system.
 editors:

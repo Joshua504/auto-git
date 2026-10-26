@@ -316,8 +316,11 @@ func isAllowed(patterns []string, p string) bool {
 // guardStaged inspects everything currently staged in the repository, unstages
 // every file that must not be committed automatically, and returns those files.
 // The files stay untouched in the working tree.
-func guardStaged(repo string) ([]blockedFile, error) {
-	output, err := run(shortTimeout, repo,
+//
+// env selects the index to inspect, for example "GIT_INDEX_FILE=<path>" for a
+// scratch index; nil means the repository's own index.
+func guardStaged(repo string, env []string) ([]blockedFile, error) {
+	output, err := runWith(runOptions{timeout: shortTimeout, path: repo, env: env},
 		"diff", "--cached", "--name-only", "-z", "--no-renames", "--diff-filter=ACMT")
 	if err != nil {
 		return nil, err
@@ -359,14 +362,14 @@ func guardStaged(repo string) ([]blockedFile, error) {
 		}
 	}
 
-	inspected, err := inspectBlobs(repo, toInspect)
+	inspected, err := inspectBlobs(repo, env, toInspect)
 	if err != nil {
 		return nil, err
 	}
 
 	blocked = append(blocked, inspected...)
 
-	if err := unstage(repo, blocked); err != nil {
+	if err := unstage(repo, env, blocked); err != nil {
 		return nil, err
 	}
 
@@ -376,13 +379,13 @@ func guardStaged(repo string) ([]blockedFile, error) {
 }
 
 // inspectBlobs checks the staged contents of paths for size and secrets.
-func inspectBlobs(repo string, paths []string) ([]blockedFile, error) {
+func inspectBlobs(repo string, env []string, paths []string) ([]blockedFile, error) {
 	var blocked []blockedFile
 
 	for start := 0; start < len(paths); start += batchSize {
 		chunk := paths[start:min(start+batchSize, len(paths))]
 
-		sizes, err := blobSizes(repo, chunk)
+		sizes, err := blobSizes(repo, env, chunk)
 		if err != nil {
 			return nil, err
 		}
@@ -400,7 +403,7 @@ func inspectBlobs(repo string, paths []string) ([]blockedFile, error) {
 			}
 		}
 
-		contents, err := readBlobs(repo, toScan)
+		contents, err := readBlobs(repo, env, toScan)
 		if err != nil {
 			return nil, err
 		}
@@ -426,12 +429,12 @@ func indexSpecs(paths []string) []byte {
 }
 
 // blobSizes returns the staged size of each path, or -1 when the entry is not a blob.
-func blobSizes(repo string, paths []string) ([]int64, error) {
+func blobSizes(repo string, env []string, paths []string) ([]int64, error) {
 	if len(paths) == 0 {
 		return nil, nil
 	}
 
-	output, err := runWith(runOptions{timeout: shortTimeout, path: repo, stdin: indexSpecs(paths)},
+	output, err := runWith(runOptions{timeout: shortTimeout, path: repo, env: env, stdin: indexSpecs(paths)},
 		"cat-file", "--batch-check")
 	if err != nil {
 		return nil, err
@@ -465,12 +468,12 @@ func blobSizes(repo string, paths []string) ([]int64, error) {
 }
 
 // readBlobs returns the staged contents of each path (nil if missing).
-func readBlobs(repo string, paths []string) ([][]byte, error) {
+func readBlobs(repo string, env []string, paths []string) ([][]byte, error) {
 	if len(paths) == 0 {
 		return nil, nil
 	}
 
-	output, err := runWith(runOptions{timeout: longTimeout, path: repo, stdin: indexSpecs(paths)},
+	output, err := runWith(runOptions{timeout: longTimeout, path: repo, env: env, stdin: indexSpecs(paths)},
 		"cat-file", "--batch")
 	if err != nil {
 		return nil, err
@@ -518,7 +521,7 @@ func readBlobs(repo string, paths []string) ([][]byte, error) {
 }
 
 // unstage removes the blocked files from the index, leaving the working tree alone.
-func unstage(repo string, blocked []blockedFile) error {
+func unstage(repo string, env []string, blocked []blockedFile) error {
 	for start := 0; start < len(blocked); start += batchSize {
 		args := []string{"reset", "-q", "--"}
 
@@ -527,7 +530,11 @@ func unstage(repo string, blocked []blockedFile) error {
 		}
 
 		// Literal pathspecs: a file named "[ab].key" must not also unstage "a.key".
-		opts := runOptions{timeout: shortTimeout, path: repo, env: []string{"GIT_LITERAL_PATHSPECS=1"}}
+		opts := runOptions{
+			timeout: shortTimeout,
+			path:    repo,
+			env:     append(append([]string{}, env...), "GIT_LITERAL_PATHSPECS=1"),
+		}
 
 		if _, err := runWith(opts, args...); err != nil {
 			return err
