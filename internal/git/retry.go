@@ -1,15 +1,16 @@
 package git
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
 
-const (
-	maxRetryAttempts = 3
-	retryDelay       = 2 * time.Second
-)
+const maxRetryAttempts = 3
+
+// retryDelay is a variable so tests can shorten it.
+var retryDelay = 2 * time.Second
 
 func retry(operation string, shouldRetry func(error) bool, action func() error) error {
 	var lastErr error
@@ -32,6 +33,11 @@ func retry(operation string, shouldRetry func(error) bool, action func() error) 
 
 func isRetryableGitError(err error) bool {
 	if err == nil {
+		return false
+	}
+
+	// A command killed by its timeout already waited long enough.
+	if errors.Is(err, errTimedOut) {
 		return false
 	}
 
