@@ -12,12 +12,13 @@ import (
 )
 
 type Config struct {
-	Interval     string       `yaml:"interval"`
-	Repositories []Repository `yaml:"repositories"`
-	Commit       CommitConfig `yaml:"commit"`
-	Backup       BackupConfig `yaml:"backup"`
-	Sync         SyncConfig   `yaml:"sync"`
-	Editors      []string     `yaml:"editors"`
+	Interval      string         `yaml:"interval"`
+	Repositories  []Repository   `yaml:"repositories"`
+	Commit        CommitConfig   `yaml:"commit"`
+	Backup        BackupConfig   `yaml:"backup"`
+	Sync          SyncConfig     `yaml:"sync"`
+	Notifications NotificationCfg `yaml:"notifications"`
+	Editors       []string       `yaml:"editors"`
 }
 
 type Repository struct {
@@ -72,6 +73,18 @@ func (c Config) PullOnOpenEnabled() bool {
 	return c.Sync.PullOnOpen == nil || *c.Sync.PullOnOpen
 }
 
+// NotificationCfg controls desktop notifications for events that need attention.
+type NotificationCfg struct {
+	// Enabled turns on popup notifications with an audible alert.
+	// When false (the default) AutoGit only writes to the log.
+	Enabled *bool `yaml:"enabled"`
+}
+
+// NotificationsEnabled reports whether desktop notifications are turned on.
+func (c Config) NotificationsEnabled() bool {
+	return c.Notifications.Enabled != nil && *c.Notifications.Enabled
+}
+
 // BackupConfig chooses how repositories are protected. Every field is optional;
 // leaving the whole section out keeps the original behavior.
 type BackupConfig struct {
@@ -84,6 +97,27 @@ type BackupConfig struct {
 
 	// Machine names this computer in the backup branch name. Default: the host name.
 	Machine string `yaml:"machine"`
+
+	// Retention controls how old backup branch snapshots are cleaned up.
+	// Only applies when mode is "branch".
+	Retention RetentionCfg `yaml:"retention"`
+}
+
+// RetentionCfg controls backup branch snapshot cleanup.
+type RetentionCfg struct {
+	// MaxAge is the maximum age of backup snapshots, in days.
+	// Snapshots older than this are pruned. Zero means no age limit.
+	MaxAge int `yaml:"max_age"`
+
+	// MaxCommits is the maximum number of snapshots to keep per backup branch.
+	// Oldest snapshots are removed when the count exceeds this limit.
+	// Zero means no count limit.
+	MaxCommits int `yaml:"max_commits"`
+}
+
+// ShouldPrune reports whether branch retention is configured.
+func (r RetentionCfg) ShouldPrune() bool {
+	return r.MaxAge > 0 || r.MaxCommits > 0
 }
 
 var (
@@ -124,6 +158,14 @@ func (b BackupConfig) validate() error {
 
 	if b.Machine != "" && !machinePattern.MatchString(b.Machine) {
 		return fmt.Errorf("backup.machine %q is not valid; use letters, digits, '.', '_' and '-'", b.Machine)
+	}
+
+	if b.Retention.MaxAge < 0 {
+		return fmt.Errorf("backup.retention.max_age must be zero or positive")
+	}
+
+	if b.Retention.MaxCommits < 0 {
+		return fmt.Errorf("backup.retention.max_commits must be zero or positive")
 	}
 
 	return nil

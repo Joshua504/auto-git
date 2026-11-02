@@ -1,14 +1,7 @@
 package git
 
 import (
-	"bytes"
-	"context"
 	"errors"
-	"fmt"
-	"os"
-	"os/exec"
-	"strconv"
-	"strings"
 	"time"
 )
 
@@ -31,6 +24,13 @@ var (
 	// open after git itself is killed; without this, a timeout could still hang.
 	waitDelay = 5 * time.Second
 )
+
+const serviceTemplate = `[Unit]
+Description=AutoGit - Automatic Git backup service
+Documentation=https://github.com/Joshua504/auto-git
+After=network-online.target
+Wants=network-online.target
+
 
 // runOptions configures a single git invocation.
 type runOptions struct {
@@ -222,6 +222,23 @@ const (
 	ModeBranch = "branch"
 )
 
+// RetentionCfg controls how old backup snapshots are cleaned up.
+type RetentionCfg struct {
+	// MaxAge is the maximum age of backup snapshots, in days.
+	// Snapshots older than this are pruned. Zero means no age limit.
+	MaxAge int
+
+	// MaxCommits is the maximum number of snapshots to keep per backup branch.
+	// Oldest snapshots are removed when the count exceeds this limit.
+	// Zero means no count limit.
+	MaxCommits int
+}
+
+// ShouldPrune reports whether retention is configured.
+func (r RetentionCfg) ShouldPrune() bool {
+	return r.MaxAge > 0 || r.MaxCommits > 0
+}
+
 // Options chooses how a repository is backed up.
 type Options struct {
 	// Mode is ModeCommit (the default when empty) or ModeBranch.
@@ -234,6 +251,10 @@ type Options struct {
 	// Machine names this computer in the backup branch name, so two computers
 	// never write to the same branch. The default is the host name.
 	Machine string
+
+	// Retention controls how old backup branch snapshots are cleaned up.
+	// Only applies when Mode is ModeBranch.
+	Retention RetentionCfg
 }
 
 // Backup backs up a repository in the default mode, ModeCommit.
@@ -242,7 +263,21 @@ func Backup(path, message string) error {
 }
 
 // BackupWith backs up a repository using the given options.
+//
+// It acquires an exclusive lock on the repository so that two AutoGit instances
+// never operate on the same repository at the same time. If the lock is already
+// held, the repository is skipped and will be retried on the next cycle.
 func BackupWith(path, message string, opts Options) error {
+	if !IsRepository(path) {
+		return fmt.Errorf("%s is not a Git repository", path)
+	}
+
+	lock, skipped := acquireLock(path)
+	if skipped != nil {
+		return skipped
+	}
+	defer releaseLock(lock)
+
 	switch opts.Mode {
 	case "", ModeCommit:
 		return backupCommit(path, message, opts)

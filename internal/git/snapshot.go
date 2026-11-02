@@ -4,11 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // DefaultBranchPrefix is the namespace of backup branches unless configured otherwise.
@@ -162,14 +164,28 @@ func backupBranch(path, message string, opts Options) error {
 	}
 
 	if remoteTip == tip {
-		return nil
+		// Nothing new to push, but still prune old snapshots.
+		_, pruneErr := PruneBackupBranch(path, names, opts.Retention)
+		return pruneErr
 	}
 
-	return retry("push backup branch", isRetryableGitError, func() error {
+	pushErr := retry("push backup branch", isRetryableGitError, func() error {
 		_, err := run(longTimeout, path, "push", "origin", tip+":"+names.remote)
 
 		return err
 	})
+
+	// After a successful push, prune old snapshots.
+	if pushErr == nil {
+		pruned, pruneErr := PruneBackupBranch(path, names, opts.Retention)
+		if pruneErr != nil {
+			log.Printf("pruning backup branch %s: %v", names.local, pruneErr)
+		} else if pruned > 0 {
+			log.Printf("pruned %d old snapshots from %s", pruned, names.local)
+		}
+	}
+
+	return pushErr
 }
 
 // snapshotTree writes a tree of everything "git add -A" would stage, built in a
@@ -469,4 +485,246 @@ func uniqueNonEmpty(values ...string) []string {
 	}
 
 	return result
+}
+
+// commitInfo holds the hash and author date of a single commit.
+type commitInfo struct {
+	hash string
+	date int64
+}
+
+// PruneBackupBranch removes old snapshots from a backup branch according to
+// the retention policy. It rewrites the branch history so that only the most
+// recent snapshots remain, then force-pushes the result to the remote.
+//
+// It returns the number of snapshots pruned.
+func PruneBackupBranch(path string, names backupNames, retention RetentionCfg) (int, error) {
+	if !retention.ShouldPrune() {
+		return 0, nil
+	}
+
+	// Get the current tip of the local backup ref.
+	localTip, err := revParseCommit(path, names.local)
+	if err != nil {
+		return 0, err
+	}
+
+	if localTip == "" {
+		return 0, nil
+	}
+
+	// List all commits on the backup branch, newest first.
+	// Format: commit hash and author date (unix timestamp), separated by tab.
+	output, err := run(shortTimeout, path, "log", "--format=%H%x09%at", localTip)
+	if err != nil {
+		return 0, fmt.Errorf("listing backup branch commits: %w", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) == 0 || (len(lines) == 1 && lines[0] == "") {
+		return 0, nil
+	}
+
+	var commits []commitInfo
+	for _, line := range lines {
+		parts := strings.Split(line, "\t")
+		if len(parts) != 2 {
+			continue
+		}
+
+		var date int64
+		_, err := fmt.Sscanf(parts[1], "%d", &date)
+		if err != nil {
+			continue
+		}
+
+		commits = append(commits, commitInfo{hash: parts[0], date: date})
+	}
+
+	if len(commits) == 0 {
+		return 0, nil
+	}
+
+	// Determine which commits to keep.
+	now := time.Now().Unix()
+	var cutoff int64
+	if retention.MaxAge > 0 {
+		cutoff = now - (int64(retention.MaxAge) * 86400)
+	}
+
+	// Find the keep boundary: the first commit that should be removed.
+	// Commits are ordered newest-first, so we keep from index 0 up to keepCount-1.
+	keepCount := 0
+	for i, c := range commits {
+		ageOK := retention.MaxAge == 0 || c.date >= cutoff
+		countOK := retention.MaxCommits == 0 || (i+1) <= retention.MaxCommits
+
+		if ageOK && countOK {
+			keepCount = i + 1
+		} else {
+			break
+		}
+	}
+
+	// Always keep at least one commit so the branch isn't empty.
+	if keepCount == 0 {
+		keepCount = 1
+	}
+
+	pruned := len(commits) - keepCount
+	if pruned <= 0 {
+		return 0, nil
+	}
+
+	// The oldest commit we're keeping.
+	oldestKept := commits[keepCount-1].hash
+
+	// Build a set of pruned commit hashes.
+	prunedHashes := make(map[string]bool)
+	for i := keepCount; i < len(commits); i++ {
+		prunedHashes[commits[i].hash] = true
+	}
+
+	// Get the parents of the oldest kept commit.
+	parentsOutput, err := run(shortTimeout, path, "rev-list", "--parents", "-1", oldestKept)
+	if err != nil {
+		return 0, err
+	}
+	parentsLine := strings.Fields(parentsOutput)
+
+	// If the oldest kept commit has no parents, it's already a root.
+	if len(parentsLine) <= 1 {
+		if _, err := run(shortTimeout, path, "update-ref", names.local, oldestKept); err != nil {
+			return 0, err
+		}
+		if err := forcePushBackupBranch(path, names, oldestKept); err != nil {
+			return 0, err
+		}
+		return pruned, nil
+	}
+
+	// Check whether any parent is pruned.
+	hasPrunedParent := false
+	for _, p := range parentsLine[1:] {
+		if prunedHashes[p] {
+			hasPrunedParent = true
+			break
+		}
+	}
+
+	if !hasPrunedParent {
+		// All parents are non-pruned (e.g., they are user commits on the real branch).
+		// Just move the ref to the oldest kept commit.
+		if _, err := run(shortTimeout, path, "update-ref", names.local, oldestKept); err != nil {
+			return 0, err
+		}
+		if err := forcePushBackupBranch(path, names, oldestKept); err != nil {
+			return 0, err
+		}
+		return pruned, nil
+	}
+
+	// At least one parent is pruned. We need to recreate the oldest kept commit
+	// without the pruned parents, then rebuild the chain of kept commits on top.
+	return rebuildKeptChain(path, names, commits, keepCount, oldestKept, prunedHashes, pruned)
+}
+
+// rebuildKeptChain recreates the kept commits so they form a clean chain
+// without pruned ancestors, then updates the ref and force-pushes.
+func rebuildKeptChain(path string, names backupNames, commits []commitInfo, keepCount int, oldestKept string, prunedHashes map[string]bool, pruned int) (int, error) {
+	// Map from original hash to new hash for rebuilt commits.
+	replacementMap := make(map[string]string)
+
+	// Rebuild from oldest kept to newest kept (index: keepCount-1 down to 0).
+	for i := keepCount - 1; i >= 0; i-- {
+		c := commits[i]
+
+		// Get the tree of this commit.
+		treeOutput, err := run(shortTimeout, path, "rev-parse", c.hash+"^{tree}")
+		if err != nil {
+			return 0, err
+		}
+		tree := strings.TrimSpace(treeOutput)
+
+		// Get the commit message.
+		msgOutput, err := run(shortTimeout, path, "log", "-1", "--format=%B", c.hash)
+		if err != nil {
+			return 0, err
+		}
+
+		// Get the author info.
+		authorOutput, err := run(shortTimeout, path, "log", "-1", "--format=%an <%ae>%n%aI", c.hash)
+		if err != nil {
+			return 0, err
+		}
+		authorLines := strings.Split(strings.TrimSpace(authorOutput), "\n")
+		if len(authorLines) < 2 {
+			return 0, fmt.Errorf("parsing author info for %s", c.hash)
+		}
+
+		emailStart := strings.Index(authorLines[0], "<")
+		emailEnd := strings.Index(authorLines[0], ">")
+		if emailStart < 0 || emailEnd <= emailStart {
+			return 0, fmt.Errorf("parsing author email for %s", c.hash)
+		}
+
+		env := []string{
+			"GIT_AUTHOR_NAME=" + strings.TrimSpace(authorLines[0][:emailStart]),
+			"GIT_AUTHOR_EMAIL=" + authorLines[0][emailStart+1:emailEnd],
+			"GIT_AUTHOR_DATE=" + authorLines[1],
+		}
+
+		// Get the parents of this commit.
+		parentsOutput, err := run(shortTimeout, path, "rev-list", "--parents", "-1", c.hash)
+		if err != nil {
+			return 0, err
+		}
+		parentsLine := strings.Fields(parentsOutput)
+
+		var newParents []string
+		for _, p := range parentsLine[1:] {
+			// If this parent was rebuilt, use the replacement.
+			if repl, ok := replacementMap[p]; ok {
+				newParents = append(newParents, repl)
+			} else if !prunedHashes[p] {
+				// Non-pruned parent (e.g., a user commit on the real branch).
+				newParents = append(newParents, p)
+			}
+			// Pruned parents are silently dropped.
+		}
+
+		args := []string{"commit-tree", tree}
+		for _, p := range newParents {
+			args = append(args, "-p", p)
+		}
+		args = append(args, "-m", strings.TrimSpace(msgOutput))
+
+		newCommit, err := runWith(runOptions{timeout: longTimeout, path: path, env: env}, args...)
+		if err != nil {
+			return 0, err
+		}
+		replacementMap[c.hash] = strings.TrimSpace(newCommit)
+	}
+
+	// The tip of the new chain is the replacement for the original tip (commits[0]).
+	tipReplacement := replacementMap[commits[0].hash]
+	if tipReplacement == "" {
+		return 0, fmt.Errorf("failed to rebuild tip commit")
+	}
+
+	if _, err := run(shortTimeout, path, "update-ref", names.local, tipReplacement); err != nil {
+		return 0, err
+	}
+
+	if err := forcePushBackupBranch(path, names, tipReplacement); err != nil {
+		return 0, err
+	}
+
+	return pruned, nil
+}
+
+// forcePushBackupBranch force-pushes the backup branch to the remote.
+func forcePushBackupBranch(path string, names backupNames, newTip string) error {
+	_, err := run(longTimeout, path, "push", "--force", "origin", newTip+":"+names.remote)
+	return err
 }

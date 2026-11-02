@@ -6,7 +6,7 @@ AutoGit is a lightweight Go application that automates routine Git operations wh
 
 The goal is simple: reduce the chance of forgetting to commit and push your work before switching computers or ending a development session.
 
-> **Project status:** Working prototype. Two backup modes, a secrets guard, repository-state checks, timeouts and retries, and editor-aware scheduling (including an opening and a closing backup) are implemented and covered by automated tests, and have been exercised against real repositories. Review the limitations below before relying on AutoGit as your only backup solution.
+> **Project status:** Working prototype. Two backup modes, a secrets guard, repository-state checks, timeouts and retries, editor-aware scheduling (including an opening and a closing backup), desktop notifications, backup branch retention, concurrency protection, and GitHub Actions CI are implemented and covered by automated tests, and have been exercised against real repositories. Review the limitations below before relying on AutoGit as your only backup solution.
 
 ---
 
@@ -217,7 +217,42 @@ It distinguishes a failure from a deliberate skip. A repository that is busy or 
 
 A failed operation is not the same as a successful backup. Review the logs and repository state when an error is reported.
 
-### 15. Automated tests
+### 15. Desktop notifications
+
+AutoGit can send desktop notifications with audible alerts for key events, so you do not need to watch the terminal log. When enabled, you receive a notification for:
+
+- **Successful backups** when changes were pushed.
+- **Failed backups** when a push or other operation fails.
+- **Skipped repositories** when a repo is locked by another process.
+- **Pulled commits** when new commits are brought in on editor open.
+- **Diverged branches** when AutoGit cannot pull because your branch and upstream each have unique commits.
+- **Blocked pulls** when uncommitted changes conflict with upstream changes.
+- **Editor state changes** when backups are enabled or paused.
+
+All notifications include an audible alert sound.
+
+```yaml
+notifications:
+  enabled: true   # the default is false; set to true to enable
+```
+
+Notifications use the `beeep` library, which calls `notify-send` on Linux, `osascript` on macOS, and Toast notifications on Windows.
+
+### 16. Backup branch retention
+
+In branch mode, each backup adds a commit to the backup branch. Without retention, these branches grow indefinitely. Retention automatically prunes old snapshots by age and count, rewriting the branch history and force-pushing the result so old snapshots are removed from both local and remote.
+
+```yaml
+backup:
+  mode: "branch"
+  retention:
+    max_age: 30        # delete snapshots older than 30 days
+    max_commits: 50    # keep at most 50 snapshots per branch
+```
+
+When both limits are set, a snapshot is pruned if it exceeds either one. At least one snapshot is always kept so the branch is never empty. Set both values to `0` or omit the `retention` section to disable pruning.
+
+### 17. Automated tests
 
 The project includes tests for configuration, editor detection, Git operations, scheduling, and the editor-monitoring loop.
 
@@ -228,6 +263,16 @@ go test ./...
 ```
 
 The project has also been exercised against a real repository to test automatic commits, pushing local changes, retrieving remote changes, divergent histories, and rebase-conflict handling.
+
+### 18. Concurrency protection
+
+If two AutoGit instances run at the same time — for example, a scheduled systemd service and a manual foreground run — they would normally race on the same repository, corrupting backup branches or creating conflicting commits. AutoGit uses an exclusive file lock (`flock`) inside each repository's `.git` directory so that only one instance can operate on a repository at a time. The second instance skips that repository and will retry on the next cycle.
+
+This protection covers both backup operations and the pull-on-open synchronization.
+
+### 19. Continuous integration
+
+A GitHub Actions workflow runs `go build`, `go vet`, and `go test -race` on every push and pull request, so broken code is caught before it reaches your branch.
 
 ---
 
@@ -400,6 +445,7 @@ Configuration file: /path/to/auto-git/config.yaml
 Backup interval: 1m
 Backup mode: commit
 Pull new commits when an editor opens: true
+Desktop notifications: off
 Repositories configured: 1
 Editors monitored: [goland pycharm code codium nvim vim zed cursor]
 AutoGit is waiting for a configured editor to open.
@@ -489,6 +535,9 @@ Replace the example repository path with the absolute path to your own local rep
 | `backup.prefix` | Branch mode only. Namespace of the backup branches. Default: `autogit`. |
 | `backup.machine` | Branch mode only. Name of this computer in the branch name. Default: the host name. |
 | `sync.pull_on_open` | `true` (default) fast-forwards each repository to its upstream when an editor opens. See [Pull on open](#pull-on-open). |
+| `backup.retention.max_age` | Branch mode only. Delete snapshots older than this many days. Zero means no age limit. See [Backup branch retention](#16-backup-branch-retention). |
+| `backup.retention.max_commits` | Branch mode only. Keep at most this many snapshots per branch. Zero means no count limit. See [Backup branch retention](#16-backup-branch-retention). |
+| `notifications.enabled` | `false` (default). Set to `true` to enable desktop notifications with audible alerts. See [Desktop notifications](#15-desktop-notifications). |
 
 Invalid `backup` settings stop AutoGit at startup with a message naming the setting.
 | `editors` | Process names used to determine whether scheduled backups should run. |
@@ -536,7 +585,9 @@ git diff HEAD origin/autogit/my-laptop/main
 git checkout origin/autogit/my-laptop/main -- path/to/file
 ```
 
-Backup branches are never deleted automatically, and they grow with every change. Deleting the branch on the remote is not enough: AutoGit keeps its own record of the newest snapshot and recreates the branch, with its full history, on the next change. To start over, delete the remote branch and AutoGit's two local records of it:
+If [retention](#16-backup-branch-retention) is configured, old snapshots are automatically pruned by age and count. Without retention, backup branches grow with every change.
+
+Deleting the branch on the remote is not enough: AutoGit keeps its own record of the newest snapshot and recreates the branch, with its full history, on the next change. To start over, delete the remote branch and AutoGit's two local records of it:
 
 ```bash
 git push origin --delete autogit/my-laptop/main
@@ -807,9 +858,51 @@ This stops the running process. It does not uninstall AutoGit or remove your rep
 
 ### Running AutoGit in the background
 
-The current documented workflow runs AutoGit in a terminal. If you close that terminal or terminate the process, scheduled backups stop.
+AutoGit can run as a systemd user service so it starts automatically at login and restarts after failures. This means you do not need to remember to start it in a terminal.
 
-Running it automatically as a background service at login would require an additional setup, such as a user-level systemd service. That setup is not currently part of the core installation instructions.
+**Battery impact is minimal.** AutoGit only performs Git operations while a configured editor is open. When no editor is running, it sleeps between short process checks. The service is configured with `RestartSec=60` and `StartLimitBurst=3` to avoid aggressive restart loops.
+
+#### Install the service
+
+Build the binary and install the service:
+
+```bash
+go build -o autogit ./cmd/autogit
+./autogit install
+```
+
+The `install` command creates a systemd user service file that points to your binary and configuration. It looks for `config.yaml` in the current directory or in `~/.config/autogit/`. You can also specify a config file directly:
+
+```bash
+./autogit install --config /path/to/config.yaml
+```
+
+After installing, enable and start the service:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now autogit.service
+```
+
+#### Check the service status
+
+```bash
+systemctl --user status autogit.service
+```
+
+#### View logs
+
+```bash
+journalctl --user -u autogit.service -f
+```
+
+#### Uninstall the service
+
+```bash
+./autogit uninstall
+```
+
+This stops the service, removes the service file, and reloads the systemd daemon.
 
 ---
 
@@ -932,13 +1025,6 @@ The race-detector command is an additional check; its successful execution shoul
 
 The Git tests create throwaway repositories in temporary directories, and every Git command they run uses a temporary home directory. Your own Git configuration, such as a global ignore file that already ignores `.env`, cannot change the results, and the tests never touch your real repositories.
 
-### Known issue
-
-`TestIsRunning` in `internal/editor` expects GoLand to be running and fails when it is not. This is unrelated to the rest of the suite. To run everything else:
-
-```bash
-go test ./cmd/... ./internal/config/... ./internal/git/... ./internal/scheduler/...
-```
 
 ### Automated scenario coverage
 
@@ -952,7 +1038,9 @@ Beyond the basics, the tests exercise these scenarios against real Git repositor
 - **Commit messages:** each placeholder is filled in, a summary names up to three files and says a shared action once, a message without placeholders is unchanged, a multi-line message works, a file named like a placeholder is not expanded, kept-out files are never named, a snapshot describes only what changed since the previous one, and a mistyped placeholder is rejected at startup.
 - **Pull on open:** new commits are fast-forwarded in with no merge commit, your staged, unstaged, and untracked work is kept, and nothing is changed when the branch has diverged, when your edits overlap incoming files, when a rebase or merge is in progress, on a detached HEAD, or when the remote is unreachable.
 - **Editor monitoring:** the pull runs before the opening backup and again on each open, a backup on open, a final backup on close, no final backup when AutoGit is stopped, and backups that never overlap.
-- **Configuration:** where the file is found, the `--config` flag, the backup section's validation, and a check that `config.example.yaml` always loads.
+- **Configuration:** where the file is found, the `--config` flag, the backup section's validation, retention settings, notification toggle, and a check that `config.example.yaml` always loads.
+- **Notifications:** enabled and disabled sender behavior.
+- **Concurrency protection:** exclusive lock acquisition, concurrent backup serialization, lock release after errors.
 
 ### Practical test coverage
 
@@ -1196,9 +1284,9 @@ Never rely solely on a global Git ignore file for secrets. Review repository-lev
 
 ### 7. It does not provide a complete backup retention system
 
-AutoGit uses your Git repository and remote. It does not independently create a versioned offline archive, provide backup retention policies, or guarantee recovery if both the local repository and remote hosting account are lost or compromised.
+AutoGit uses your Git repository and remote. It does not independently create a versioned offline archive or guarantee recovery if both the local repository and remote hosting account are lost or compromised.
 
-In branch mode, backup branches are never deleted or trimmed automatically. They grow with every change, so remove ones you no longer need. See [Troubleshooting](#i-deleted-a-backup-branch-and-it-came-back-branch-mode).
+In branch mode, [backup branch retention](#16-backup-branch-retention) can automatically prune old snapshots by age and count. Without it, branches grow indefinitely.
 
 Maintain independent backups for important work.
 
@@ -1224,9 +1312,9 @@ A cycle can encounter an error while committing, fetching, rebasing, or pushing.
 
 AutoGit does not lock files, coordinate simultaneous editing across computers, or prevent two users or devices from modifying the same code concurrently. Git's normal synchronization and conflict mechanisms still apply.
 
-### 12. Background-service setup is separate
+### 12. Background service requires systemd
 
-The core workflow requires AutoGit to remain running. Starting it automatically at login, restarting it after a crash, and managing it as a system service require additional setup.
+AutoGit can run as a systemd user service (see [Running AutoGit in the background](#running-autogit-in-the-background)). If your system does not use systemd, you will need to arrange for AutoGit to start at login through another mechanism.
 
 ### 13. Branch mode does not push your own branch
 
@@ -1279,7 +1367,8 @@ auto-git/
 ├── cmd/
 │   └── autogit/
 │       ├── main.go
-│       └── main_test.go
+│       ├── main_test.go
+│       └── install.go
 ├── internal/
 │   ├── config/
 │   │   ├── config.go
@@ -1297,6 +1386,8 @@ auto-git/
 │   │   ├── git_test.go
 │   │   ├── guard.go
 │   │   ├── guard_test.go
+│   │   ├── lock.go
+│   │   ├── lock_test.go
 │   │   ├── message.go
 │   │   ├── message_test.go
 │   │   ├── pull.go
@@ -1308,9 +1399,15 @@ auto-git/
 │   │   ├── state.go
 │   │   ├── state_test.go
 │   │   └── sync_test.go
+│   ├── notify/
+│   │   ├── notify.go
+│   │   └── notify_test.go
 │   └── scheduler/
 │       ├── scheduler.go
 │       └── scheduler_test.go
+├── .github/
+│   └── workflows/
+│       └── ci.yaml
 ├── config.example.yaml
 ├── .gitignore
 ├── go.mod
@@ -1324,7 +1421,8 @@ Some files may differ as the project evolves. This layout describes the current 
 
 ### Package responsibilities
 
-- `cmd/autogit`: application entry point, command-line flags, configuration loading, and the editor-monitoring loop that triggers the opening and closing backups.
+- `cmd/autogit`: application entry point, command-line flags, configuration loading, the editor-monitoring loop that triggers the opening and closing backups, and the `install`/`uninstall` subcommands for systemd service management.
+    - `install.go`: installing and removing the systemd user service.
 - `internal/config`: configuration parsing, validation, and finding the configuration file.
 - `internal/editor`: detection of configured editor processes.
 - `internal/git`: everything that touches a repository.
@@ -1335,6 +1433,8 @@ Some files may differ as the project evolves. This layout describes the current 
     - `pull.go`: bringing in new remote commits when an editor opens.
     - `state.go`: repository-state checks, skipped cycles, and the identity check.
     - `retry.go`: retrying temporary network failures.
+    - `lock.go`: exclusive per-repository file locks to prevent concurrent AutoGit instances from racing.
+- `internal/notify`: desktop notifications with audible alerts using the `beeep` library.
 - `internal/scheduler`: scheduled backup execution and lifecycle management.
 
 ---
@@ -1343,8 +1443,7 @@ Some files may differ as the project evolves. This layout describes the current 
 
 Possible future improvements include:
 
-- **Backup retention:** automatically trim old snapshots on backup branches.
-- **Service management:** start AutoGit at login and restart it after failures.
+- **Service management improvements:** better error reporting and status commands for the systemd service.
 - **Cross-platform editor monitoring:** support native process detection on macOS and Windows.
 - **Improved backup reporting:** clearer per-repository status and explicit success or failure summaries.
 - **Configurable secrets guard:** let the file-name rules, content patterns, and size limit be changed in `config.yaml`, and add a review mode before committing.
@@ -1354,10 +1453,8 @@ Possible future improvements include:
 - **Pulling during a session:** check for new remote commits on a schedule, not only when an editor opens.
 - **Optional final backup on shutdown:** run a last backup when AutoGit itself is stopped.
 - **Conflict recovery guidance:** clearer instructions for recovering after failed synchronization.
-- **Notifications:** report failed pushes, conflicts, and successful backups.
 - **Backup history:** record when each repository was checked and whether changes reached the remote.
 - **Configuration improvements:** allow editor monitoring to be disabled for users who prefer scheduled backups regardless of editor state.
-- **Editor test independence:** make the editor detection test work without GoLand running.
 
 These are potential future improvements, not claims about features already implemented.
 

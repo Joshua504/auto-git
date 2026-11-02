@@ -43,12 +43,37 @@ backup:
   # prefix: "autogit"          # namespace of the backup branches
   # machine: "my-laptop"       # defaults to this computer's host name
 
+  # Retention controls how old backup branch snapshots are cleaned up.
+  # Only applies when mode is "branch". Without retention, backup branches
+  # grow indefinitely as each backup adds a commit.
+  #
+  # max_age: 30                # delete snapshots older than 30 days
+  # max_commits: 50            # keep at most 50 snapshots per branch
+  #
+  # When both are set, a snapshot is pruned if it exceeds either limit.
+  # Pruning rewrites the backup branch history and force-pushes the result,
+  # so old snapshots are removed from both local and remote.
+  retention:
+    max_age: 30
+    max_commits: 50
+
 # When an editor opens, bring in anything pushed from another computer before
 # the first backup, so you start from the latest code. This only fast-forwards:
 # it never merges, rebases or stashes, and it leaves everything alone if your
 # uncommitted changes touch the same files or your branch has diverged.
 sync:
   pull_on_open: true
+
+# Desktop notifications for events that need your attention.
+# When enabled AutoGit pops up a notification and plays a sound for:
+#   - Successful backups (push completed)
+#   - Failed backups (push error, merge conflict)
+#   - Skipped repositories (locked by another process)
+#   - Diverged or blocked pulls (new commits conflict with local work)
+#
+# Notifications are off by default. Set to true to turn them on.
+notifications:
+  enabled: false
 
 # Process names that mean "an editor is open". Each must match what
 # `pgrep -x <name>` finds on your system.

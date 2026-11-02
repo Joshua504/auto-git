@@ -48,6 +48,12 @@ func SyncOnOpen(path string) (OpenSyncResult, error) {
 		return OpenSyncResult{}, fmt.Errorf("%s is not a Git repository", path)
 	}
 
+	lock, skipped := acquireLock(path)
+	if skipped != nil {
+		return OpenSyncResult{}, skipped
+	}
+	defer releaseLock(lock)
+
 	// Never move a branch the user is in the middle of working on.
 	reason, err := busyReason(path)
 	if err != nil {

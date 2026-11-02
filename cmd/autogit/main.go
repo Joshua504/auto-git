@@ -16,10 +16,34 @@ import (
 	"github.com/Joshua504/auto-git/internal/config"
 	"github.com/Joshua504/auto-git/internal/editor"
 	"github.com/Joshua504/auto-git/internal/git"
+	"github.com/Joshua504/auto-git/internal/notify"
 	"github.com/Joshua504/auto-git/internal/scheduler"
 )
 
 func main() {
+	// Handle subcommands before the general flag set so that `autogit install`
+	// and `autogit uninstall` work without requiring a config file.
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "install":
+			installFlag := flag.NewFlagSet("install", flag.ExitOnError)
+			installFlagConfig := installFlag.String("config", "",
+				"path to the configuration file")
+			installFlag.Parse(os.Args[2:])
+
+			if err := cmdInstall(*installFlagConfig); err != nil {
+				log.Fatalf("Install failed: %v", err)
+			}
+			return
+
+		case "uninstall":
+			if err := cmdUninstall(); err != nil {
+				log.Fatalf("Uninstall failed: %v", err)
+			}
+			return
+		}
+	}
+
 	configFlag := flag.String("config", "",
 		"path to the configuration file (default: ./config.yaml, then ~/.config/autogit/config.yaml)")
 	flag.Parse()
@@ -47,25 +71,39 @@ func main() {
 		Mode:    cfg.Backup.Mode,
 		Prefix:  cfg.Backup.Prefix,
 		Machine: cfg.Backup.Machine,
+		Retention: git.RetentionCfg{
+			MaxAge:     cfg.Backup.Retention.MaxAge,
+			MaxCommits: cfg.Backup.Retention.MaxCommits,
+		},
 	}
+
+	nc := notify.New(cfg.NotificationsEnabled())
 
 	backupTask := func() {
 		for _, repository := range cfg.Repositories {
 			log.Printf("Checking repository: %s", repository.Path)
+
+			// Track whether the repo had changes so we can notify on a real push.
+			hadChanges, _ := git.HasChanges(repository.Path)
 
 			if err := git.BackupWith(repository.Path, cfg.Commit.Message, backupOptions); err != nil {
 				// A busy repository is not a failure; the next cycle tries again.
 				var skipped *git.SkippedError
 				if errors.As(err, &skipped) {
 					log.Printf("Skipping %s: %s", repository.Path, skipped.Reason)
+					nc.Warning("AutoGit: Skipped", fmt.Sprintf("%s — %s", repository.Path, skipped.Reason))
 					continue
 				}
 
 				log.Printf("Backup failed for %s: %v", repository.Path, err)
+				nc.Error("AutoGit: Backup Failed", fmt.Sprintf("%s — %v", repository.Path, err))
 				continue
 			}
 
 			log.Printf("Backup check completed for %s", repository.Path)
+			if hadChanges {
+				nc.Success("AutoGit: Backup Complete", fmt.Sprintf("Pushed changes from %s", repository.Path))
+			}
 		}
 	}
 
@@ -75,6 +113,22 @@ func main() {
 
 			if message := openSyncMessage(repository.Path, cfg.Backup.Mode, result, err); message != "" {
 				log.Print(message)
+
+				// Notify for events that need attention.
+				if err != nil {
+					var skipped *git.SkippedError
+					if errors.As(err, &skipped) {
+						nc.Warning("AutoGit: Skipped", fmt.Sprintf("%s — %s", repository.Path, skipped.Reason))
+					} else {
+						nc.Error("AutoGit: Sync Failed", fmt.Sprintf("%s — %v", repository.Path, err))
+					}
+				} else if result.Outcome == git.OpenSyncFastForwarded {
+					nc.Success("AutoGit: Pulled", fmt.Sprintf("Pulled %s into %s", pluralize(result.Commits, "new commit"), repository.Path))
+				} else if result.Outcome == git.OpenSyncDiverged {
+					nc.Warning("AutoGit: Diverged", fmt.Sprintf("%s has commits the upstream lacks, and vice versa.", repository.Path))
+				} else if result.Outcome == git.OpenSyncBlocked {
+					nc.Warning("AutoGit: Blocked", fmt.Sprintf("Uncommitted changes in %s block pulling.", repository.Path))
+				}
 			}
 		}
 	}
@@ -119,6 +173,7 @@ func main() {
 		pollEvery: editorPollInterval,
 		scheduler: s,
 		backup:    backupTask,
+		notify:    nc,
 	}
 
 	if pullOnOpen {
@@ -196,6 +251,7 @@ type watcher struct {
 	pollEvery time.Duration        // how often to call isRunning
 	scheduler *scheduler.Scheduler // runs backup periodically while an editor is open
 	backup    func()               // one backup pass over every configured repository
+	notify    notify.Sender        // sends desktop notifications for state changes
 
 	// pull, when set, runs once each time an editor opens, before the first
 	// backup, to bring in commits made elsewhere. It may be nil.
@@ -241,6 +297,7 @@ func (w *watcher) run(ctx context.Context) {
 			}(stop, done)
 
 			log.Println("A configured editor is open. AutoGit backups enabled.")
+			w.notify.Success("AutoGit: Backups Enabled", "A configured editor is open; backups are now active.")
 
 		case !running && stop != nil:
 			close(stop)
@@ -252,6 +309,7 @@ func (w *watcher) run(ctx context.Context) {
 			log.Println("No configured editors are open. Running a final backup.")
 			w.backup()
 			log.Println("AutoGit backups paused.")
+			w.notify.Success("AutoGit: Backups Paused", "No editors are open; backups are paused until you open one.")
 		}
 
 		select {

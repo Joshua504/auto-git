@@ -139,3 +139,117 @@ func TestExampleConfigUsesBranchMode(t *testing.T) {
 		t.Fatalf("expected the example to use branch mode, got %q", cfg.Backup.Mode)
 	}
 }
+
+func TestRetentionIsOffByDefault(t *testing.T) {
+	cfg := validBase()
+
+	if cfg.Backup.Retention.ShouldPrune() {
+		t.Fatal("retention must be off when neither max_age nor max_commits is set")
+	}
+}
+
+func TestRetentionCanBeConfigured(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+
+	yaml := `interval: "1m"
+repositories:
+  - path: "/repo"
+commit:
+  message: "msg"
+backup:
+  mode: "branch"
+  retention:
+    max_age: 30
+    max_commits: 50
+editors:
+  - goland
+`
+
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !cfg.Backup.Retention.ShouldPrune() {
+		t.Fatal("retention must be on when max_age and max_commits are set")
+	}
+
+	if cfg.Backup.Retention.MaxAge != 30 {
+		t.Fatalf("max_age = %d, want 30", cfg.Backup.Retention.MaxAge)
+	}
+
+	if cfg.Backup.Retention.MaxCommits != 50 {
+		t.Fatalf("max_commits = %d, want 50", cfg.Backup.Retention.MaxCommits)
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRetentionRejectsNegativeValues(t *testing.T) {
+	cfg := validBase()
+	cfg.Backup.Retention.MaxAge = -1
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "max_age") {
+		t.Fatalf("negative max_age should be rejected, got: %v", err)
+	}
+
+	cfg = validBase()
+	cfg.Backup.Retention.MaxCommits = -5
+
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "max_commits") {
+		t.Fatalf("negative max_commits should be rejected, got: %v", err)
+	}
+}
+
+func TestRetentionWithOnlyMaxAge(t *testing.T) {
+	cfg := validBase()
+	cfg.Backup.Retention.MaxAge = 30
+
+	if !cfg.Backup.Retention.ShouldPrune() {
+		t.Fatal("retention must be on when max_age is set")
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRetentionWithOnlyMaxCommits(t *testing.T) {
+	cfg := validBase()
+	cfg.Backup.Retention.MaxCommits = 50
+
+	if !cfg.Backup.Retention.ShouldPrune() {
+		t.Fatal("retention must be on when max_commits is set")
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExampleConfigShowsRetention(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "config.example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !cfg.Backup.Retention.ShouldPrune() {
+		t.Fatal("expected the example to show retention enabled")
+	}
+
+	if cfg.Backup.Retention.MaxAge != 30 {
+		t.Fatalf("expected max_age 30 in example, got %d", cfg.Backup.Retention.MaxAge)
+	}
+
+	if cfg.Backup.Retention.MaxCommits != 50 {
+		t.Fatalf("expected max_commits 50 in example, got %d", cfg.Backup.Retention.MaxCommits)
+	}
+}
