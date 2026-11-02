@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -68,6 +69,16 @@ func main() {
 		}
 	}
 
+	pullTask := func() {
+		for _, repository := range cfg.Repositories {
+			result, err := git.SyncOnOpen(repository.Path)
+
+			if message := openSyncMessage(repository.Path, cfg.Backup.Mode, result, err); message != "" {
+				log.Print(message)
+			}
+		}
+	}
+
 	s, err := scheduler.New(interval, backupTask)
 	if err != nil {
 		log.Fatalf("Error creating scheduler: %v", err)
@@ -96,6 +107,9 @@ func main() {
 	}
 
 	fmt.Printf("Backup mode: %s\n", backupMode)
+
+	pullOnOpen := cfg.PullOnOpenEnabled()
+	fmt.Printf("Pull new commits when an editor opens: %t\n", pullOnOpen)
 	fmt.Printf("Repositories configured: %d\n", len(cfg.Repositories))
 	fmt.Printf("Editors monitored: %v\n", cfg.Editors)
 	fmt.Println("AutoGit is waiting for a configured editor to open.")
@@ -107,8 +121,66 @@ func main() {
 		backup:    backupTask,
 	}
 
+	if pullOnOpen {
+		w.pull = pullTask
+	}
+
 	w.run(ctx)
 	fmt.Println("AutoGit stopped.")
+}
+
+// openSyncMessage describes what the check on editor open found, in words that
+// fit the backup mode. It returns "" when there is nothing worth saying.
+func openSyncMessage(path, mode string, result git.OpenSyncResult, err error) string {
+	if err != nil {
+		var skipped *git.SkippedError
+		if errors.As(err, &skipped) {
+			return fmt.Sprintf("Skipping %s: %s", path, skipped.Reason)
+		}
+
+		return fmt.Sprintf("Could not check %s for new commits: %v", path, err)
+	}
+
+	switch result.Outcome {
+	case git.OpenSyncFastForwarded:
+		return fmt.Sprintf("Pulled %s into %s", pluralize(result.Commits, "new commit"), path)
+
+	case git.OpenSyncDiverged:
+		message := fmt.Sprintf("Not pulling in %s: your branch and its upstream each have commits the other lacks.", path)
+
+		if mode == git.ModeBranch {
+			return message + " Run git pull yourself to combine them."
+		}
+
+		return message + " AutoGit will try to combine them during the next backup."
+
+	case git.OpenSyncBlocked:
+		files := result.Conflicts
+		listed := strings.Join(files, ", ")
+
+		if len(files) > 3 {
+			listed = fmt.Sprintf("%s and %d more", strings.Join(files[:3], ", "), len(files)-3)
+		}
+
+		message := fmt.Sprintf("Not pulling in %s: your uncommitted changes touch files that also changed upstream (%s).", path, listed)
+
+		if mode == git.ModeBranch {
+			return message + " Commit or stash them, then pull."
+		}
+
+		return message + " AutoGit will commit them and try to combine the two during the next backup."
+
+	default:
+		return fmt.Sprintf("Nothing to pull in %s", path)
+	}
+}
+
+func pluralize(count int, noun string) string {
+	if count == 1 {
+		return "1 " + noun
+	}
+
+	return fmt.Sprintf("%d %ss", count, noun)
 }
 
 // editorPollInterval is how often AutoGit checks whether an editor is open.
@@ -124,6 +196,10 @@ type watcher struct {
 	pollEvery time.Duration        // how often to call isRunning
 	scheduler *scheduler.Scheduler // runs backup periodically while an editor is open
 	backup    func()               // one backup pass over every configured repository
+
+	// pull, when set, runs once each time an editor opens, before the first
+	// backup, to bring in commits made elsewhere. It may be nil.
+	pull func()
 }
 
 // run blocks until ctx is cancelled.
@@ -150,6 +226,12 @@ func (w *watcher) run(ctx context.Context) {
 
 			go func(stop <-chan struct{}, done chan<- struct{}) {
 				defer close(done)
+
+				// Start from the latest code: take in anything pushed from another
+				// computer before looking at your own changes.
+				if w.pull != nil {
+					w.pull()
+				}
 
 				// Catch up on anything that changed while no editor was open,
 				// instead of waiting a full interval for the first backup.

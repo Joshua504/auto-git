@@ -83,12 +83,11 @@ func newBackupNames(path string, opts Options) (backupNames, error) {
 	return names, nil
 }
 
-// currentBranchLabel names the checked-out branch, or "detached" for a
-// detached HEAD. Branch mode backs up detached work too, under that name.
-func currentBranchLabel(path string) (string, error) {
+// rawBranchName is the checked-out branch's name, or "detached" for a detached HEAD.
+func rawBranchName(path string) (string, error) {
 	output, err := run(shortTimeout, path, "symbolic-ref", "--quiet", "--short", "HEAD")
 	if err == nil {
-		return refLabel(strings.TrimSpace(output), "branch"), nil
+		return strings.TrimSpace(output), nil
 	}
 
 	var exitErr *exec.ExitError
@@ -97,6 +96,17 @@ func currentBranchLabel(path string) (string, error) {
 	}
 
 	return "", fmt.Errorf("checking the current branch: %w", err)
+}
+
+// currentBranchLabel is the branch name made safe for use inside a ref name.
+// Branch mode backs up a detached HEAD too, under the name "detached".
+func currentBranchLabel(path string) (string, error) {
+	name, err := rawBranchName(path)
+	if err != nil {
+		return "", err
+	}
+
+	return refLabel(name, "branch"), nil
 }
 
 // backupBranch keeps a snapshot of the working tree on a backup branch.
@@ -128,7 +138,7 @@ func backupBranch(path, message string, opts Options) error {
 
 	reportBlocked(path, blocked)
 
-	tip, err := snapshotCommit(path, names, tree, message)
+	tip, err := snapshotCommit(path, names, tree, message, opts)
 	if err != nil {
 		return err
 	}
@@ -249,7 +259,7 @@ func snapshotTree(path string) (string, []blockedFile, error) {
 
 // snapshotCommit returns the commit that represents tree on the backup branch,
 // creating it if needed. It returns "" when there is nothing to back up.
-func snapshotCommit(path string, names backupNames, tree, message string) (string, error) {
+func snapshotCommit(path string, names backupNames, tree, message string, opts Options) (string, error) {
 	head, err := revParseCommit(path, "HEAD")
 	if err != nil {
 		return "", err
@@ -302,17 +312,14 @@ func snapshotCommit(path string, names backupNames, tree, message string) (strin
 		}
 	}
 
-	if len(parents) == 0 {
-		// An empty repository has nothing worth a backup branch.
-		emptyTree, err := runWith(runOptions{timeout: shortTimeout, path: path, stdin: []byte{}},
-			"hash-object", "-t", "tree", "--stdin")
-		if err != nil {
-			return "", err
-		}
+	emptyTree, err := emptyTreeID(path)
+	if err != nil {
+		return "", err
+	}
 
-		if tree == strings.TrimSpace(emptyTree) {
-			return "", nil
-		}
+	// An empty repository has nothing worth a backup branch.
+	if len(parents) == 0 && tree == emptyTree {
+		return "", nil
 	}
 
 	// Nothing changed since the only parent: reuse it rather than make an empty commit.
@@ -331,13 +338,40 @@ func snapshotCommit(path string, names backupNames, tree, message string) (strin
 		return "", err
 	}
 
+	// Describe what changed since the snapshot this one follows, or since the
+	// start of your history for the very first one.
+	text := message
+
+	if hasPlaceholders(message) {
+		before := emptyTree
+
+		if len(parents) > 0 {
+			output, err := run(shortTimeout, path, "rev-parse", parents[0]+"^{tree}")
+			if err != nil {
+				return "", err
+			}
+
+			before = strings.TrimSpace(output)
+		}
+
+		changes, err := treeChanges(path, before, tree)
+		if err != nil {
+			return "", err
+		}
+
+		text, err = renderCommitMessage(path, message, opts, changes)
+		if err != nil {
+			return "", err
+		}
+	}
+
 	args := []string{"commit-tree", tree}
 
 	for _, parent := range parents {
 		args = append(args, "-p", parent)
 	}
 
-	args = append(args, "-m", message, "-m", describeSnapshot(names.branch, head))
+	args = append(args, "-m", text, "-m", describeSnapshot(names.branch, head))
 
 	commit, err := run(longTimeout, path, args...)
 	if err != nil {

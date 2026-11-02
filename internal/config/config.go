@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ type Config struct {
 	Repositories []Repository `yaml:"repositories"`
 	Commit       CommitConfig `yaml:"commit"`
 	Backup       BackupConfig `yaml:"backup"`
+	Sync         SyncConfig   `yaml:"sync"`
 	Editors      []string     `yaml:"editors"`
 }
 
@@ -24,6 +26,50 @@ type Repository struct {
 
 type CommitConfig struct {
 	Message string `yaml:"message"`
+}
+
+// messagePlaceholders are the names a commit message may use, in braces.
+var messagePlaceholders = []string{"summary", "files", "branch", "host", "repo", "date", "time", "datetime"}
+
+// MessagePlaceholders returns the placeholders a commit message may use.
+func MessagePlaceholders() []string {
+	return append([]string(nil), messagePlaceholders...)
+}
+
+// placeholderPattern finds {word} in a commit message. Braces around anything
+// containing a space are ordinary text and are left alone.
+var placeholderPattern = regexp.MustCompile(`\{([^{}\s]+)\}`)
+
+// validateMessageTemplate rejects an unknown placeholder at startup, so a typo
+// such as {sumary} cannot end up written literally into every commit.
+func validateMessageTemplate(message string) error {
+	for _, match := range placeholderPattern.FindAllStringSubmatch(message, -1) {
+		if slices.Contains(messagePlaceholders, match[1]) {
+			continue
+		}
+
+		listed := make([]string, len(messagePlaceholders))
+		for i, name := range messagePlaceholders {
+			listed[i] = "{" + name + "}"
+		}
+
+		return fmt.Errorf("commit.message uses {%s}, which is not a placeholder; use one of: %s",
+			match[1], strings.Join(listed, ", "))
+	}
+
+	return nil
+}
+
+// SyncConfig controls how AutoGit brings in changes made elsewhere.
+type SyncConfig struct {
+	// PullOnOpen makes AutoGit fast-forward each repository to its upstream when
+	// an editor opens, before the first backup. It is on unless set to false.
+	PullOnOpen *bool `yaml:"pull_on_open"`
+}
+
+// PullOnOpenEnabled reports whether to pull new remote commits when an editor opens.
+func (c Config) PullOnOpenEnabled() bool {
+	return c.Sync.PullOnOpen == nil || *c.Sync.PullOnOpen
 }
 
 // BackupConfig chooses how repositories are protected. Every field is optional;
@@ -125,6 +171,10 @@ func (c Config) Validate() error {
 
 	if strings.TrimSpace(c.Commit.Message) == "" {
 		return fmt.Errorf("commit message is required")
+	}
+
+	if err := validateMessageTemplate(c.Commit.Message); err != nil {
+		return err
 	}
 
 	return c.Backup.validate()

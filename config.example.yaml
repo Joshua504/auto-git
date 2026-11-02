@@ -16,8 +16,20 @@ interval: "1m"
 repositories:
   - path: "/path/to/your/repository"
 
+# The commit message. It can describe what each backup contains, so your history
+# is readable instead of a column of identical lines. Placeholders:
+#
+#   {summary}   what changed, e.g. "update main.go, add notes.txt and 2 more"
+#   {files}     how many files changed
+#   {branch}    the branch you are on
+#   {host}      this computer's name (backup.machine, or the host name)
+#   {repo}      the repository's folder name
+#   {date} {time} {datetime}   when the backup was made
+#
+# A message with no placeholders is used exactly as written. A mistyped
+# placeholder stops AutoGit at startup instead of appearing in every commit.
 commit:
-  message: "chore: automatic backup"
+  message: "backup: {summary}"
 
 # How your work is protected.
 #
@@ -30,6 +42,13 @@ backup:
   mode: "branch"
   # prefix: "autogit"          # namespace of the backup branches
   # machine: "my-laptop"       # defaults to this computer's host name
+
+# When an editor opens, bring in anything pushed from another computer before
+# the first backup, so you start from the latest code. This only fast-forwards:
+# it never merges, rebases or stashes, and it leaves everything alone if your
+# uncommitted changes touch the same files or your branch has diverged.
+sync:
+  pull_on_open: true
 
 # Process names that mean "an editor is open". Each must match what
 # `pgrep -x <name>` finds on your system.

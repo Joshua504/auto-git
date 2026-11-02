@@ -139,11 +139,21 @@ func hasStagedChanges(path string) (bool, error) {
 	return false, err
 }
 
+// IsBehindRemote reports whether the branch's upstream has commits the branch
+// does not have.
 func IsBehindRemote(path string) (bool, error) {
+	count, err := commitsBehindUpstream(path)
+
+	return count > 0, err
+}
+
+// commitsBehindUpstream counts the commits the upstream has that the current
+// branch does not. A branch with no upstream has none.
+func commitsBehindUpstream(path string) (int, error) {
 	// Identify the current branch.
 	branchOutput, err := run(shortTimeout, path, "symbolic-ref", "--quiet", "--short", "HEAD")
 	if err != nil {
-		return false, fmt.Errorf("checking current branch failed: %w", err)
+		return 0, fmt.Errorf("checking current branch failed: %w", err)
 	}
 
 	// The command's output ends with a newline. Left in place, it would end up
@@ -156,33 +166,33 @@ func IsBehindRemote(path string) (bool, error) {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 			// No upstream is configured. Backup can attempt the initial push.
-			return false, nil
+			return 0, nil
 		}
 
-		return false, fmt.Errorf("checking branch remote failed: %w", err)
+		return 0, fmt.Errorf("checking branch remote failed: %w", err)
 	}
 
 	if strings.TrimSpace(remoteOutput) == "" {
-		return false, nil
+		return 0, nil
 	}
 
 	// An upstream is configured, so failure to resolve it must be reported.
 	if _, err := run(shortTimeout, path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"); err != nil {
-		return false, fmt.Errorf("resolving configured upstream failed: %w", err)
+		return 0, fmt.Errorf("resolving configured upstream failed: %w", err)
 	}
 
 	// Count commits present on the upstream but missing locally.
 	countOutput, err := run(shortTimeout, path, "rev-list", "--count", "HEAD..@{upstream}")
 	if err != nil {
-		return false, fmt.Errorf("checking remote commits failed: %w", err)
+		return 0, fmt.Errorf("checking remote commits failed: %w", err)
 	}
 
 	count, err := strconv.Atoi(strings.TrimSpace(countOutput))
 	if err != nil {
-		return false, fmt.Errorf("parsing remote commit count %q: %w", countOutput, err)
+		return 0, fmt.Errorf("parsing remote commit count %q: %w", countOutput, err)
 	}
 
-	return count > 0, nil
+	return count, nil
 }
 
 // Pull rebases local commits onto the upstream. It uses --autostash because
@@ -235,7 +245,7 @@ func Backup(path, message string) error {
 func BackupWith(path, message string, opts Options) error {
 	switch opts.Mode {
 	case "", ModeCommit:
-		return backupCommit(path, message)
+		return backupCommit(path, message, opts)
 	case ModeBranch:
 		return backupBranch(path, message, opts)
 	default:
@@ -245,7 +255,7 @@ func BackupWith(path, message string, opts Options) error {
 
 // backupCommit commits changes on the current branch, brings in remote
 // changes, and pushes.
-func backupCommit(path, message string) error {
+func backupCommit(path, message string, opts Options) error {
 	if !IsRepository(path) {
 		return fmt.Errorf("%s is not a Git repository", path)
 	}
@@ -291,7 +301,22 @@ func backupCommit(path, message string) error {
 		}
 
 		if staged {
-			if err := Commit(path, message); err != nil {
+			// Describe only what is actually being committed: this runs after
+			// the secrets guard, so files it kept out are never named.
+			text := message
+
+			if hasPlaceholders(message) {
+				changes, err := stagedChanges(path, nil)
+				if err != nil {
+					return skipIfLocked(err)
+				}
+
+				if text, err = renderCommitMessage(path, message, opts, changes); err != nil {
+					return err
+				}
+			}
+
+			if err := Commit(path, text); err != nil {
 				return skipIfLocked(err)
 			}
 		}
