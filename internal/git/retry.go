@@ -31,6 +31,12 @@ func retry(operation string, shouldRetry func(error) bool, action func() error) 
 	return fmt.Errorf("%s failed: %w", operation, lastErr)
 }
 
+// IsRetryableGitError reports whether the error is likely caused by a
+// transient network problem and can be retried later.
+func IsRetryableGitError(err error) bool {
+	return isRetryableGitError(err)
+}
+
 func isRetryableGitError(err error) bool {
 	if err == nil {
 		return false

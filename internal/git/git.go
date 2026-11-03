@@ -1,7 +1,14 @@
 package git
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -24,13 +31,6 @@ var (
 	// open after git itself is killed; without this, a timeout could still hang.
 	waitDelay = 5 * time.Second
 )
-
-const serviceTemplate = `[Unit]
-Description=AutoGit - Automatic Git backup service
-Documentation=https://github.com/Joshua504/auto-git
-After=network-online.target
-Wants=network-online.target
-
 
 // runOptions configures a single git invocation.
 type runOptions struct {
@@ -232,11 +232,23 @@ type RetentionCfg struct {
 	// Oldest snapshots are removed when the count exceeds this limit.
 	// Zero means no count limit.
 	MaxCommits int
+
+	// KeepDaily keeps the last snapshot of each of the last N days.
+	// Zero means no daily retention.
+	KeepDaily int
+
+	// KeepWeekly keeps the last snapshot of each of the last N weeks.
+	// Zero means no weekly retention.
+	KeepWeekly int
+
+	// KeepMonthly keeps the last snapshot of each of the last N months.
+	// Zero means no monthly retention.
+	KeepMonthly int
 }
 
 // ShouldPrune reports whether retention is configured.
 func (r RetentionCfg) ShouldPrune() bool {
-	return r.MaxAge > 0 || r.MaxCommits > 0
+	return r.MaxAge > 0 || r.MaxCommits > 0 || r.KeepDaily > 0 || r.KeepWeekly > 0 || r.KeepMonthly > 0
 }
 
 // Options chooses how a repository is backed up.
@@ -378,4 +390,22 @@ func backupCommit(path, message string, opts Options) error {
 
 	// Push only after synchronization succeeds.
 	return Push(path)
+}
+
+// CurrentCommitHash returns the full SHA-1 of the commit at HEAD.
+func CurrentCommitHash(path string) (string, error) {
+	output, err := run(shortTimeout, path, "rev-parse", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("reading HEAD commit: %w", err)
+	}
+	return strings.TrimSpace(output), nil
+}
+
+// RemoteURL returns the URL of the origin remote.
+func RemoteURL(path string) (string, error) {
+	output, err := run(shortTimeout, path, "remote", "get-url", "origin")
+	if err != nil {
+		return "", fmt.Errorf("reading remote URL: %w", err)
+	}
+	return strings.TrimSpace(output), nil
 }

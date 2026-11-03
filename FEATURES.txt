@@ -1,0 +1,1323 @@
+================================================================================
+                        AutoGit — Complete Feature Guide
+              All Features, How They Work, and How to Use Them
+================================================================================
+
+Table of Contents
+--------------------------------------------------------------------------------
+1.  Overview
+2.  Configuration System
+3.  Two Backup Modes (Commit & Branch)
+4.  Automatic Change Detection
+5.  Dynamic Commit Messages
+6.  Secrets Guard
+7.  Secrets Guard Allowlist
+8.  Remote Synchronization
+9.  Divergent History Handling (Rebase)
+10. Pull on Open (Sync on Editor Start)
+11. Branch Snapshots (Branch Mode)
+12. Backup Branch Retention Policies
+13. Repository State Checks
+14. Concurrency Protection (File Locking)
+15. Retry Logic for Network Errors
+16. Command-Timeouts
+17. Editor Detection
+18. Closing Backup
+19. Scheduling Policies (Fixed, Smart, Hybrid)
+20. Per-Repository Scheduling
+21. Power-Aware Scheduling
+22. Desktop Notifications
+23. Offline Backup Queue
+24. Backup Verification
+25. Health Checks
+26. Snapshot Restore
+27. Snapshot History & Filtering
+28. Snapshot Comparison & Diff
+29. Storage Analysis
+30. Cleanup (Queue Maintenance)
+31. Systemd Service Installation
+32. CLI Commands Reference
+33. How to Use AutoGit — End-to-End Workflow
+
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+AutoGit is a lightweight Go application that automates routine Git operations
+while you work. It monitors configured code editors, periodically checks
+configured repositories, and backs up your work to your Git remote.
+
+The goal is simple: reduce the chance of forgetting to commit and push your
+work before switching computers or ending a development session.
+
+AutoGit uses Git rather than implementing its own version-control system.
+Your repositories, commits, branches, and remotes remain ordinary Git
+repositories.
+
+
+================================================================================
+2. CONFIGURATION SYSTEM
+================================================================================
+
+How it works:
+AutoGit reads a YAML configuration file (config.yaml) that defines which
+repositories to monitor, how often to back them up, which editors to watch,
+and how to handle backups.
+
+Configuration file locations (checked in order):
+  1. An explicit path passed via --config flag
+  2. config.yaml in the current working directory
+  3. ~/.config/autogit/config.yaml (Linux)
+
+The third location lets AutoGit start from any directory, for example from
+a desktop autostart entry or a systemd service.
+
+Configuration structure:
+
+  interval: "5m"                          # How often to check repositories
+  repositories:                           # List of repos to monitor
+    - path: "/home/user/projects/myapp"
+    - path: "/home/user/projects/mylib"
+      schedule:                           # Per-repo scheduling override
+        policy: "smart"
+        interval: "10m"
+      retention:                          # Per-repo retention override
+        max_age: 30
+        max_commits: 50
+  commit:
+    message: "backup: {summary}"          # Commit message template
+  backup:
+    mode: "branch"                        # "commit" (default) or "branch"
+    prefix: "autogit"                     # Backup branch namespace
+    machine: "my-laptop"                  # Machine identifier
+    retention:                            # Global retention defaults
+      max_age: 30
+      max_commits: 100
+      keep_daily: 7
+      keep_weekly: 4
+      keep_monthly: 6
+  sync:
+    pull_on_open: true                    # Fast-forward on editor open
+  verification:
+    enabled: true                         # Periodic backup verification
+    interval: "24h"
+  notifications:
+    enabled: true                         # Desktop popup notifications
+    events:
+      backup_success: true
+      backup_failure: true
+      manual_intervention: true
+      queue_sync: true
+      branch_diverged: false
+  power:
+    battery_interval: "30m"              # Slower interval on battery
+    low_battery_percent: 15              # Pause auto-backups below 15%
+  offline_queue:
+    enabled: true                         # Persist failed backups
+    path: ""                              # Default: ~/.config/autogit/queue.db
+    retry_delay: "30s"
+    max_retries: 5
+  editors:                                # Editor process names to monitor
+    - "goland"
+    - "code"
+    - "vim"
+
+How to use it:
+  - Copy config.example.yaml to config.yaml in your project directory or
+    ~/.config/autogit/config.yaml
+  - Edit the file to match your repositories and preferences
+  - Run: autogit --config /path/to/config.yaml
+  - Or simply run: autogit (it will find config.yaml automatically)
+
+
+================================================================================
+3. TWO BACKUP MODES (COMMIT & BRANCH)
+================================================================================
+
+AutoGit can protect your work in two fundamentally different ways.
+
+--- Commit Mode (default) ---
+
+How it works:
+  1. AutoGit checks your working tree for changes
+  2. It stages all changes (git add .)
+  3. The secrets guard scans staged files and removes dangerous ones
+  4. It creates a commit on your current branch
+  5. It fetches the latest remote history
+  6. If the remote is ahead, it rebases local commits onto the upstream
+  7. It pushes your branch to origin
+
+This mode commits directly to the branch you are working on. Your Git history
+will contain AutoGit's automated commits alongside your manual ones.
+
+Configuration:
+  backup:
+    mode: "commit"    # or simply omit the backup section entirely
+
+--- Branch Mode (recommended) ---
+
+How it works:
+  1. AutoGit copies your Git index to a scratch file (never touches your real
+     index)
+  2. It stages everything into the scratch copy
+  3. The secrets guard scans and removes dangerous files
+  4. It writes a tree object and creates a commit
+  5. The commit is pushed to a separate backup branch:
+     autogit/<machine>/<branch>
+  6. Your real branch, index, and working tree are only read, never changed
+
+Branch mode leaves your branch, staged files, and working tree alone.
+Staged, unstaged, and untracked files are all captured (except what the
+secrets guard keeps out). The snapshot's history includes your own commits,
+so unpushed work is protected too.
+
+Configuration:
+  backup:
+    mode: "branch"
+    prefix: "autogit"       # Namespace for backup branches
+    machine: "my-laptop"    # Identifies this computer
+
+How to choose:
+  - Use "commit" mode if you want automated commits on your working branch
+  - Use "branch" mode if you want a completely non-intrusive backup that
+    never touches your working branch
+
+
+================================================================================
+4. AUTOMATIC CHANGE DETECTION
+================================================================================
+
+How it works:
+AutoGit checks each configured repository for changes using Git's
+working-tree status (git status --porcelain). It detects:
+
+  - Tracked file modifications
+  - Tracked file deletions
+  - Untracked files that Git has not been configured to ignore
+
+When changes exist, AutoGit proceeds with the backup workflow. When no
+changes exist, the repository is skipped for that cycle.
+
+In commit mode, AutoGit skips creating a commit when there are no local
+changes to commit, or when the secrets guard kept out everything that changed.
+
+How to use it:
+  This feature works automatically. Simply configure your repositories and
+  let AutoGit run. It will only create commits when there is actual work
+  to save.
+
+
+================================================================================
+5. DYNAMIC COMMIT MESSAGES
+================================================================================
+
+How it works:
+Instead of producing a column of identical "AutoGit backup" lines in your
+history, AutoGit can generate descriptive commit messages that describe
+what each backup contains.
+
+The message template supports these placeholders:
+
+  {summary}  — Human-readable description of changes, e.g.:
+               "update main.go, add notes.txt and 2 more"
+               Names up to 3 files; truncates to 60 characters.
+  {files}    — Number of changed files (integer)
+  {branch}   — Current branch name
+  {host}     — Machine hostname
+  {repo}     — Repository directory name
+  {date}     — Current date (YYYY-MM-DD)
+  {time}     — Current time (HH:MM:SS)
+  {datetime} — Current date and time (YYYY-MM-DD HH:MM:SS)
+
+The summary is generated after the secrets guard runs, so files that were
+kept out are never named in the message.
+
+Examples:
+  "backup: {summary}"
+    -> "backup: update main.go, add notes.txt"
+
+  "AutoGit backup on {branch} at {datetime} ({files} files)"
+    -> "AutoGit backup on main at 2025-01-15 14:30:00 (3 files)"
+
+If a message has no placeholders (no braces), it is used exactly as written
+without running any extra Git commands.
+
+How to use it:
+  commit:
+    message: "backup: {summary}"
+
+  The template is validated at startup, so a typo like {sumary} will be
+  caught before any commits are made.
+
+
+================================================================================
+6. SECRETS GUARD
+================================================================================
+
+How it works:
+Before anything is saved, a secrets guard keeps files that look like
+credentials, private keys, or oversized files out of the backup. It runs
+after staging and before committing, so blocked files stay modified in your
+working tree but are never committed.
+
+The guard uses three layers of detection:
+
+Layer 1 — File Name Rules:
+  Blocked basenames:
+    id_rsa, id_dsa, id_ecdsa, id_ed25519 (SSH private keys)
+    .netrc, .pgpass, .htpasswd, .pypirc, .git-credentials (credentials)
+    .envrc (environment file)
+    credentials.json, secrets.json, secrets.yaml, secrets.yml
+
+  Blocked extensions:
+    .key (private key)
+    .p12, .pfx (certificate bundle with private key)
+    .jks, .keystore (Java keystore)
+    .kdbx (password database)
+    .ppk (PuTTY private key)
+    .tfstate (Terraform state)
+
+  Blocked suffixes:
+    _rsa, _dsa, _ecdsa, _ed25519 (SSH private keys)
+
+  Environment files:
+    .env, .env.local, .env.production, etc.
+    (Templates like .env.example, .env.sample are allowed)
+
+  Blocked directories:
+    .ssh/ (SSH directory)
+    .aws/ (AWS credentials)
+    .gnupg/ (GPG directory)
+    .kube/ (Kubernetes config)
+
+Layer 2 — Content Scanning:
+  Files up to 1 MB are scanned for known secret patterns:
+    - Private key headers (-----BEGIN ... PRIVATE KEY-----)
+    - AWS access key IDs (AKIA/ASIA prefix)
+    - AWS secret access keys
+    - GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_, github_pat_)
+    - Slack tokens (xox[abprs]-)
+    - Google API keys (AIza prefix)
+    - Stripe live keys (sk_live_)
+    - Anthropic API keys (sk-ant-)
+    - OpenAI API keys (sk-proj-, sk-)
+    - Solana keypairs (JSON array of 64 bytes)
+
+  Binary files and files larger than 1 MB are skipped for content scanning.
+
+Layer 3 — File Size Limit:
+  Files larger than 25 MB are blocked regardless of content.
+
+When a file is blocked, it is unstaged from the index but left untouched
+in the working tree. A warning is logged. The same warning is not repeated
+on every cycle; it only repeats when the set of blocked files changes.
+
+How to use it:
+  The guard runs automatically on every backup cycle. No configuration is
+  needed. If a file you want to back up is being blocked, add its path to
+  the .autogit-allow file in the repository (see section 7).
+
+
+================================================================================
+7. SECRETS GUARD ALLOWLIST
+================================================================================
+
+How it works:
+If the secrets guard is blocking a file you actually want to back up, you
+can create an allowlist file in the repository root.
+
+File: .autogit-allow
+
+Format — one path pattern per line:
+  .env.local           — A name with no slash matches in any directory
+  config/dev.key       — A path with a slash matches from the root
+  /dev.key             — A leading slash anchors to the root only
+  fixtures/            — A trailing slash allows everything under a directory
+
+Blank lines and lines starting with # are ignored.
+
+How to use it:
+  1. Create a file called .autogit-allow in your repository root
+  2. Add the paths you want to exempt from the guard, one per line:
+
+     # Allow test fixtures
+     fixtures/
+
+     # Allow a specific config file
+     config/test.env
+
+  3. The allowlist is read on every backup cycle
+
+
+================================================================================
+8. REMOTE SYNCHRONIZATION
+================================================================================
+
+How it works:
+After creating a local commit (in commit mode), AutoGit synchronizes with
+the remote:
+
+  1. Fetch — Downloads the latest refs from origin
+  2. Behind check — Counts how many commits the upstream has that the local
+     branch does not
+  3. Rebase — If behind, rebases local commits onto the upstream history
+     (using --autostash to handle uncommitted files the guard kept out)
+  4. Push — Pushes the current branch to origin
+
+The push uses the upstream tracking ref (git push -u origin HEAD), so it
+works regardless of the branch name.
+
+How to use it:
+  Synchronization happens automatically after each commit. Ensure your
+  repository has an "origin" remote configured:
+
+    git remote add origin <url>
+
+
+================================================================================
+9. DIVERGENT HISTORY HANDLING (REBASE)
+================================================================================
+
+How it works:
+When local and remote branches contain different commits, AutoGit attempts
+to rebase the local commits onto the upstream history. This helps preserve
+both sets of commits when their changes can be reconciled.
+
+The rebase uses --autostash because files the secrets guard kept out of the
+commit stay modified in the working tree, and Git refuses to rebase over
+uncommitted changes.
+
+If the rebase fails (e.g., conflicts), AutoGit:
+  1. Attempts to abort the rebase (git rebase --abort)
+  2. Restores the repository to its pre-rebase state
+  3. Reports the failure and does not push conflicting history
+
+Important: AutoGit does not automatically resolve merge or rebase conflicts.
+Manual intervention may be necessary before another successful synchronization.
+
+How to use it:
+  This is automatic. If a conflict occurs, check the logs and resolve it
+  manually. AutoGit will retry on the next cycle.
+
+
+================================================================================
+10. PULL ON OPEN (SYNC ON EDITOR START)
+================================================================================
+
+How it works:
+When a configured editor opens, AutoGit runs SyncOnOpen before the first
+backup. This brings new remote commits into the current branch so you start
+from the latest code instead of piling changes onto a stale branch.
+
+It only ever fast-forwards:
+  - No merge commit is created
+  - No history is rewritten
+  - Nothing is stashed
+
+If a fast-forward is not possible, it changes nothing and reports why:
+
+  - "up to date" — The upstream had nothing new
+  - "fast-forwarded" — New commits were brought in
+  - "diverged" — The branch and upstream each have commits the other lacks
+  - "blocked by local changes" — Uncommitted changes touch files the new
+    commits also change (lists the conflicting files)
+
+The overlapping changes check compares your local modified/untracked files
+against the files changed by incoming commits. If they overlap, the pull is
+blocked and the conflicting files are named.
+
+Configuration:
+  sync:
+    pull_on_open: true    # Enabled by default; set to false to disable
+
+How to use it:
+  Enabled by default. Simply open a configured editor and AutoGit will
+  synchronize before backing up.
+
+
+================================================================================
+11. BRANCH SNAPSHOTS (BRANCH MODE)
+================================================================================
+
+How it works:
+In branch mode, each cycle AutoGit:
+
+  1. Copies your Git index to a scratch file (.git/autogit-index)
+  2. Stages everything into the scratch copy (git add -A)
+  3. Runs the secrets guard on the scratch index
+  4. Writes a tree object (git write-tree)
+  5. Creates a commit on the backup branch (git commit-tree)
+  6. Updates the local backup ref (git update-ref)
+  7. Pushes to the remote backup branch
+
+The backup branch name is: autogit/<machine>/<branch>
+
+For example, on a machine named "laptop" working on branch "feature/login":
+  autogit/laptop/feature+login
+
+(Slashes in branch names become "+" to avoid ref hierarchy collisions.)
+
+The snapshot's history includes your own commits, so unpushed work on your
+real branch is protected on the remote even if it was never pushed to the
+real branch.
+
+If the network is down, the snapshot is still taken locally. Nothing is lost
+while offline, and the next cycle pushes everything.
+
+How to use it:
+  Set backup.mode to "branch" in config.yaml. Optionally configure:
+    - backup.prefix (default: "autogit")
+    - backup.machine (default: hostname)
+
+
+================================================================================
+12. BACKUP BRANCH RETENTION POLICIES
+================================================================================
+
+How it works:
+Retention policies control how old backup branch snapshots are cleaned up.
+They only apply in branch mode. After a successful push, AutoGit evaluates
+the retention rules and prunes snapshots that no longer qualify.
+
+Retention can be configured globally (under backup.retention) or per-
+repository (under each repository's retention key). Per-repository settings
+override the global defaults.
+
+Five retention rules are available:
+
+  1. max_age (days)
+     Snapshots older than this number of days are pruned.
+     Zero means no age limit.
+
+  2. max_commits (count)
+     Keeps only the N most recent snapshots per backup branch.
+     Oldest snapshots are removed when the count exceeds this limit.
+     Zero means no count limit.
+
+  3. keep_daily (days)
+     Keeps the last snapshot of each of the last N days.
+     Zero means no daily retention.
+
+  4. keep_weekly (weeks)
+     Keeps the last snapshot of each of the last N weeks.
+     Zero means no weekly retention.
+
+  5. keep_monthly (months)
+     Keeps the last snapshot of each of the last N months.
+     Zero means no monthly retention.
+
+Additionally, a protected branch check ensures that snapshots that are
+ancestors of user branches are never pruned, even if they would otherwise
+be removed by the retention rules.
+
+When pruning, AutoGit rewrites the backup branch history so that only the
+kept snapshots remain, then force-pushes the result to the remote. The
+history chain is rebuilt to maintain valid parent relationships.
+
+Configuration example:
+  backup:
+    retention:
+      max_age: 30           # Remove snapshots older than 30 days
+      max_commits: 100      # Keep at most 100 snapshots
+      keep_daily: 7         # Always keep one snapshot per day for 7 days
+      keep_weekly: 4        # Always keep one snapshot per week for 4 weeks
+      keep_monthly: 6       # Always keep one snapshot per month for 6 months
+
+Per-repository override:
+  repositories:
+    - path: "/home/user/projects/myapp"
+      retention:
+        max_age: 14         # Only keep 14 days for this repo
+        max_commits: 50
+
+How to use it:
+  Add a retention section to your config. At least one rule must be
+  non-zero for pruning to occur.
+
+
+================================================================================
+13. REPOSITORY STATE CHECKS
+================================================================================
+
+How it works:
+Before AutoGit changes anything in a repository, it inspects the repository
+state to ensure it is safe to operate. It checks for:
+
+  - Unfinished Git operations:
+      Rebase in progress (rebase-merge, rebase-apply)
+      Merge in progress (MERGE_HEAD)
+      Cherry-pick in progress (CHERRY_PICK_HEAD)
+      Revert in progress (REVERT_HEAD)
+      Bisect in progress (BISECT_LOG)
+
+  - Index lock file (index.lock):
+      If another Git process is using the repository, AutoGit skips it.
+      The lock file age is reported to help identify stale locks.
+
+  - Unresolved merge conflicts:
+      Even without a marker file, unmerged entries in the index are detected.
+
+  - Detached HEAD:
+      In commit mode, AutoGit refuses to commit on a detached HEAD because
+      commits made there belong to no branch and can never be pushed.
+      (In branch mode, detached HEAD is backed up under the name "detached".)
+
+  - Git identity:
+      Before committing, AutoGit verifies that user.name and user.email are
+      configured. If not, it reports an actionable error message.
+
+If any check fails, the repository is skipped for that cycle and will be
+retried on the next cycle.
+
+How to use it:
+  This feature works automatically. No configuration is needed. If a
+  repository is skipped, check the logs for the reason.
+
+
+================================================================================
+14. CONCURRENCY PROTECTION (FILE LOCKING)
+================================================================================
+
+How it works:
+AutoGit uses exclusive file locks (flock) to prevent two instances from
+operating on the same repository simultaneously.
+
+The lock file is stored inside the repository's .git directory:
+  .git/autogit.lock
+
+When AutoGit starts a backup for a repository:
+  1. It opens the lock file
+  2. It attempts a non-blocking exclusive lock (LOCK_EX | LOCK_NB)
+  3. If the lock is already held by another AutoGit instance, the repository
+     is skipped and will be retried on the next cycle
+  4. When the backup completes, the lock file is closed, releasing the lock
+
+This protects against:
+  - Multiple AutoGit processes running at the same time
+  - A manual backup (CLI trigger) overlapping with the scheduled backup
+  - Race conditions between backup cycles
+
+How to use it:
+  This feature works automatically. No configuration is needed.
+
+
+================================================================================
+15. RETRY LOGIC FOR NETWORK ERRORS
+================================================================================
+
+How it works:
+Git operations that touch the network (fetch, push) are wrapped in automatic
+retry logic. When a transient network error occurs, AutoGit retries up to 3
+times with a 2-second delay between attempts.
+
+Retryable errors (temporary network failures):
+  - "could not resolve host"
+  - "could not resolve hostname"
+  - "failed to connect"
+  - "connection timed out"
+  - "connection reset"
+  - "network is unreachable"
+  - "temporary failure in name resolution"
+  - "remote end hung up unexpectedly"
+  - "service unavailable"
+  - "bad gateway"
+  - "gateway timeout"
+  - "timed out"
+  - "unable to access"
+
+Non-retryable errors (permanent failures):
+  - "authentication failed"
+  - "permission denied"
+  - "could not read username"
+  - "repository not found"
+  - "does not appear to be a git repository"
+  - "no configured push destination"
+  - "no such remote"
+  - "non-fast-forward"
+  - "rejected"
+
+Commands killed by their timeout are not retried — the timeout has already
+waited long enough, and the next scheduled backup cycle is the natural retry.
+
+How to use it:
+  This feature works automatically. No configuration is needed.
+
+
+================================================================================
+16. COMMAND TIMEOUTS
+================================================================================
+
+How it works:
+Every Git command executed by AutoGit has a timeout to prevent hanging:
+
+  - Short timeout (30 seconds): Quick, local, read-only commands
+    (git status, git rev-parse, git diff, git log, etc.)
+
+  - Long timeout (2 minutes): Commands that touch the network, run hooks,
+    or may take a while on large repositories
+    (git fetch, git push, git add, git commit, git rebase)
+
+When a command exceeds its timeout, it is killed. A 5-second grace period
+allows spawned helpers (ssh, git-remote-https) to release their output pipes.
+
+How to use it:
+  This feature works automatically. If a command is timing out, consider
+  increasing the interval or checking your network connection.
+
+
+================================================================================
+17. EDITOR DETECTION
+================================================================================
+
+How it works:
+AutoGit monitors whether any configured code editor is running. It uses
+pgrep to check for running processes by name.
+
+When at least one configured editor is running:
+  - AutoGit activates and begins its backup cycle
+  - The scheduler runs at the configured interval
+
+When no configured editor is running:
+  - AutoGit pauses and stops running backups
+  - It still periodically checks for editor processes
+
+Closing Backup:
+  When the last configured editor closes, AutoGit runs one final backup
+  so your last edits are saved, then pauses.
+
+Configuration:
+  editors:
+    - "goland"       # GoLand
+    - "code"         # VS Code
+    - "vim"          # Vim
+    - "nvim"         # Neovim
+    - "subl"         # Sublime Text
+    - "atom"         # Atom
+
+How to use it:
+  List the process names of your editors in the config file. Use:
+    pgrep -a <name>
+  to find the correct process name.
+
+
+================================================================================
+18. CLOSING BACKUP
+================================================================================
+
+How it works:
+When AutoGit detects that the last configured editor has closed, it runs
+one final backup cycle for all repositories. This ensures your last edits
+are saved before AutoGit pauses.
+
+After the closing backup completes, AutoGit enters a paused state and waits
+for an editor to open again.
+
+How to use it:
+  This feature works automatically. Simply close your editor and AutoGit
+  will back up your work one last time.
+
+
+================================================================================
+19. SCHEDULING POLICIES (FIXED, SMART, HYBRID)
+================================================================================
+
+How it works:
+AutoGit supports three scheduling policies that control when backups run.
+Policies can be set globally or per-repository.
+
+--- Fixed Policy (default) ---
+Backs up on every scheduler tick, regardless of whether anything changed.
+This is the original behavior.
+
+Configuration:
+  repositories:
+    - path: "/home/user/projects/myapp"
+      schedule:
+        policy: "fixed"
+
+--- Smart Policy ---
+Backs up only when there are uncommitted changes, with a safety fallback
+interval that forces a backup even when nothing has changed.
+
+Parameters:
+  - activity_window: How far back to look for recent changes (default: 1h).
+    If a repository has had changes within this window, it is considered
+    active and will be backed up on the next tick.
+
+  - safety_interval: Maximum time between backups even when nothing has
+    changed (default: 24h). This ensures a repository is never left
+    un-backed-up for too long.
+
+Configuration:
+  repositories:
+    - path: "/home/user/projects/myapp"
+      schedule:
+        policy: "smart"
+        activity_window: "1h"
+        safety_interval: "24h"
+
+--- Hybrid Policy ---
+Combines smart detection with a configurable minimum interval. It backs up
+immediately when changes are detected, but also respects a minimum interval
+between backups to avoid excessive work on very active repositories.
+
+Parameters:
+  - min_interval: Minimum time between two backups for the same repository
+    (default: 1m).
+
+  - activity_window: How far back to look for recent changes (default: 1h).
+
+Configuration:
+  repositories:
+    - path: "/home/user/projects/myapp"
+      schedule:
+        policy: "hybrid"
+        min_interval: "1m"
+        activity_window: "1h"
+
+How to use it:
+  Choose a policy based on your workflow:
+  - "fixed" for simple, predictable backups
+  - "smart" to reduce unnecessary backups on inactive repos
+  - "hybrid" for very active repos where you want to throttle backup frequency
+
+
+================================================================================
+20. PER-REPOSITORY SCHEDULING
+================================================================================
+
+How it works:
+Each repository can override the global interval and scheduling policy.
+This is useful when you have repositories with different activity levels.
+
+Configuration:
+  interval: "5m"                          # Global default
+
+  repositories:
+    - path: "/home/user/projects/active"
+      schedule:
+        policy: "hybrid"
+        interval: "2m"                    # More frequent for active repo
+        min_interval: "30s"
+
+    - path: "/home/user/projects/archive"
+      schedule:
+        policy: "smart"
+        interval: "30m"                   # Less frequent for archive
+        safety_interval: "48h"
+
+How to use it:
+  Add a schedule section to any repository entry to override the global
+  settings for that repository.
+
+
+================================================================================
+21. POWER-AWARE SCHEDULING
+================================================================================
+
+How it works:
+On Linux, AutoGit can detect whether the system is running on battery power
+by reading /sys/class/power_supply/. When on battery, it can:
+
+  1. Use a slower backup interval (battery_interval)
+  2. Pause automatic backups entirely when battery drops below a threshold
+     (low_battery_percent)
+
+The power state is cached for 5 seconds to avoid frequent sysfs reads.
+Manual backups (CLI triggers) always bypass the power check.
+
+Power states detected:
+  - Charging
+  - Discharging (on battery)
+  - Full
+  - AC (plugged in, no battery)
+
+When a power state transition is detected (e.g., unplugging the charger),
+the scheduler automatically adjusts the backup interval.
+
+Configuration:
+  power:
+    battery_interval: "30m"      # Use 30-minute interval on battery
+    low_battery_percent: 15      # Pause auto-backups below 15% battery
+
+How to use it:
+  Add a power section to your config. This is especially useful for
+  laptop users who want to conserve battery while still getting backups
+  when plugged in.
+
+
+================================================================================
+22. DESKTOP NOTIFICATIONS
+================================================================================
+
+How it works:
+When enabled, AutoGit sends desktop notifications (popup alerts) for
+significant events. On Linux, it uses the freedesktop.org Desktop
+Notifications Specification via the beeep library.
+
+Five notification event types:
+
+  1. backup_success — Posted when a backup push completes
+  2. backup_failure — Posted when a backup push fails
+  3. manual_intervention — Posted when a repository needs user action
+     (e.g., merge conflict, diverged history)
+  4. queue_sync — Posted when pending offline backups are synchronized
+     after connectivity returns
+  5. branch_diverged — Posted when a backup branch has diverged from
+     its target and requires attention
+
+Deduplication:
+  Error-like notifications (backup_failure, manual_intervention) are
+  deduplicated to avoid spamming:
+  - A 5-minute cooldown prevents the same message from repeating
+  - After 3 repeats, the same message is permanently suppressed until
+    the error changes
+  - Success and informational events are always delivered
+
+Configuration:
+  notifications:
+    enabled: true
+    events:
+      backup_success: true
+      backup_failure: true
+      manual_intervention: true
+      queue_sync: true
+      branch_diverged: false    # Disable this specific event
+
+How to use it:
+  Set notifications.enabled to true. Optionally fine-tune which events
+  trigger notifications via the events map.
+
+
+================================================================================
+23. OFFLINE BACKUP QUEUE
+================================================================================
+
+How it works:
+When enabled, backup operations that fail due to network issues are stored
+locally in a SQLite database and retried when connectivity returns. This
+ensures no backup is lost even if the network is down for an extended period.
+
+The queue persists across application restarts. When AutoGit starts, it
+checks for pending entries and processes them if the network is available.
+
+Queue entry lifecycle:
+  1. A backup commit is created locally but push fails
+  2. The entry is added to the queue with status "pending"
+  3. The processor checks for network availability every retry_delay
+  4. When network is available, it attempts to push
+  5. On success, the entry is marked "completed"
+  6. On failure, the retry count is incremented
+  7. After max_retries failures, the entry is marked "failed"
+
+Network detection:
+  The processor performs a lightweight DNS connectivity check (UDP to
+  8.8.8.8:53) before attempting to process pending entries.
+
+Database location:
+  Default: ~/.config/autogit/queue.db
+  Custom:  configured via offline_queue.path
+
+Configuration:
+  offline_queue:
+    enabled: true
+    path: ""                    # Default: ~/.config/autogit/queue.db
+    retry_delay: "30s"          # Check every 30 seconds
+    max_retries: 5              # Give up after 5 failed attempts
+
+How to use it:
+  Enable the queue in your config. AutoGit will automatically queue failed
+  backups and retry them when the network returns.
+
+  You can also manage the queue via CLI:
+    autogit queue list          # Show all queued entries
+    autogit queue pending       # Show pending entries
+    autogit queue completed     # Show completed entries
+    autogit queue failed        # Show permanently failed entries
+    autogit queue clear         # Clear completed entries
+
+
+================================================================================
+24. BACKUP VERIFICATION
+================================================================================
+
+How it works:
+AutoGit can periodically verify that backups are recoverable. The
+verification process performs these checks:
+
+  1. Fetches the latest refs from the remote
+  2. Verifies the expected backup reference exists on the remote
+  3. Compares the expected commit hash with the remote backup commit
+  4. Verifies the snapshot can be fetched (tree objects are accessible)
+  5. Spot-checks up to 3 blob objects to ensure they are not corrupted
+
+In commit mode, it checks the current branch's upstream.
+In branch mode, it checks the backup branch's remote tracking ref.
+
+Verification can run:
+  - Periodically when enabled in the config
+  - On demand via the CLI (autogit verify)
+
+Configuration:
+  verification:
+    enabled: true               # Run verification periodically
+    interval: "24h"             # Check every 24 hours
+
+How to use it:
+  Enable verification in your config or run manually:
+    autogit verify
+
+  The verify command reports the status of each repository's backup,
+  including whether the remote is reachable, the ref exists, the hash
+  matches, and the snapshot is fetchable.
+
+
+================================================================================
+25. HEALTH CHECKS
+================================================================================
+
+How it works:
+The health check performs a comprehensive diagnostic on each configured
+repository. It evaluates:
+
+  1. Path existence — Does the directory exist on the filesystem?
+  2. Git validity — Is it a valid Git repository?
+  3. Current branch — What branch is checked out?
+  4. Remote configuration — Is a remote (origin) configured?
+  5. Remote reachability — Can the remote be contacted?
+  6. Authentication — Did authentication to the remote succeed?
+  7. Operation state — Is a Git operation in progress?
+  8. Sync status — How many commits behind/ahead of the remote?
+
+Health statuses:
+  - Healthy: Fully operational, no issues
+  - Degraded: Has issues but may still be partially functional
+  - Unhealthy: Critical issues; cannot be backed up
+
+The health check uses a 15-second timeout for remote connectivity tests
+to avoid blocking.
+
+How to use it:
+  Run: autogit health
+
+  The output shows the health status of each repository, including any
+  issues or warnings. This is useful for troubleshooting.
+
+
+================================================================================
+26. SNAPSHOT RESTORE
+================================================================================
+
+How it works:
+In branch mode, AutoGit stores snapshots on backup branches. You can
+restore files or entire snapshots from these backups.
+
+Three restore methods:
+
+  1. Restore a single file:
+     Extracts one file from a snapshot commit to a destination path.
+     Uses git show to read the file content.
+
+  2. Restore to a separate directory:
+     Restores the full tree of a snapshot to a new directory.
+     Initializes a temporary Git environment, fetches the commit,
+     checks out the tree, and cleans up Git metadata.
+
+  3. Restore to working tree:
+     Restores a snapshot into the current working tree without moving HEAD.
+     Overwrites tracked files in place.
+
+How to use it:
+  List available snapshots:
+    autogit restore list /path/to/repo
+
+  Restore a single file:
+    autogit restore file /path/to/repo <snapshot-hash> <file-path> <dest-path>
+
+  Restore entire snapshot to a directory:
+    autogit restore dir /path/to/repo <snapshot-hash> <dest-dir>
+
+  Restore to working tree:
+    autogit restore worktree /path/to/repo <snapshot-hash>
+
+
+================================================================================
+27. SNAPSHOT HISTORY & FILTERING
+================================================================================
+
+How it works:
+AutoGit can list the full history of all backup snapshots across all backup
+branches. The history includes metadata for each snapshot:
+
+  - Commit hash (full and short)
+  - Author date
+  - Author name and email
+  - Machine name (extracted from backup branch name)
+  - Branch name (the working branch that was backed up)
+  - Commit message
+  - List of files in the snapshot tree
+  - Estimated size of the snapshot
+  - Sync status (whether the snapshot has been pushed to the remote)
+
+Filtering options:
+  - Machine name (case-insensitive partial match)
+  - Branch name (case-insensitive partial match)
+  - Commit message search (case-insensitive substring match)
+  - Result limit
+  - Chronological order (oldest-first or newest-first)
+
+How to use it:
+  List all snapshots:
+    autogit history /path/to/repo
+
+  Filter by machine:
+    autogit history /path/to/repo --machine laptop
+
+  Filter by branch:
+    autogit history /path/to/repo --branch main
+
+  Search by message:
+    autogit history /path/to/repo --search "login"
+
+  Limit results:
+    autogit history /path/to/repo --limit 10
+
+  Oldest first:
+    autogit history /path/to/repo --chronological
+
+
+================================================================================
+28. SNAPSHOT COMPARISON & DIFF
+================================================================================
+
+How it works:
+AutoGit can compare two snapshots and show the differences at the file and
+line level. The comparison groups changes by status:
+
+  - Added files (present in "to" but not in "from")
+  - Modified files (changed between snapshots)
+  - Deleted files (present in "from" but not in "to")
+  - Renamed files (moved between snapshots)
+
+For each file, it provides:
+  - File path
+  - Old path (for renames)
+  - Change status (A/M/D/R)
+  - Whether the file is binary
+  - Unified diff text (for text files)
+
+You can also compare a snapshot against the current working tree by using
+"WORKTREE" as the target hash.
+
+How to use it:
+  Compare two snapshots:
+    autogit compare /path/to/repo <from-hash> <to-hash>
+
+  Compare snapshot against working tree:
+    autogit compare /path/to/repo <snapshot-hash> WORKTREE
+
+  Show diff for a specific file:
+    autogit compare /path/to/repo <from-hash> <to-hash> --file <path>
+
+
+================================================================================
+29. STORAGE ANALYSIS
+================================================================================
+
+How it works:
+AutoGit can analyze disk space usage for backup data. The storage analysis
+reports:
+
+  Per-repository:
+    - .git directory size
+    - Number of backup commits
+    - Estimated object store size for backup refs
+    - Latest snapshot tree size
+    - Top N largest files in the latest snapshot
+    - Backup growth rate (commits per day)
+
+  Aggregate:
+    - Total .git directory size across all repos
+    - Total backup commit count
+    - Total backup object size
+    - Cleanup recommendations
+
+Recommendations are generated based on thresholds:
+  - More than 100 backup commits: Suggests tightening retention
+  - Files larger than 10 MB: Suggests adding to .gitignore
+  - Growth rate above 5 commits/day: Suggests adding retention policy
+  - .git directory larger than 500 MB: Suggests running git gc
+
+How to use it:
+  Check storage for all configured repos:
+    autogit storage
+
+  The output shows per-repository storage data and aggregate totals with
+  recommendations for cleanup.
+
+
+================================================================================
+30. CLEANUP (QUEUE MAINTENANCE)
+================================================================================
+
+How it works:
+The cleanup command removes completed entries from the offline backup queue
+database. Over time, the queue database can grow as completed entries
+accumulate. Running cleanup frees disk space.
+
+How to use it:
+  autogit queue clear
+
+  This removes all entries with status "completed" from the queue database.
+
+
+================================================================================
+31. SYSTEMD SERVICE INSTALLATION
+================================================================================
+
+How it works:
+AutoGit can be installed as a systemd user service so it starts automatically
+at login and restarts after failures.
+
+The install command:
+  1. Finds the AutoGit binary path
+  2. Resolves the configuration file path
+  3. Generates a systemd service unit file
+  4. Writes it to ~/.config/systemd/autogit.service
+
+The service configuration:
+  - Restarts on failure with 60-second delay
+  - Limits restarts to 3 times in 300 seconds
+  - Sets GIT_TERMINAL_PROMPT=0 to prevent interactive prompts
+  - Uses Nice=10 for reduced CPU priority
+  - Starts after network-online.target
+
+Battery impact is minimal: AutoGit only does work while a configured editor
+is open. When no editor is running, it sleeps between 5-second pgrep checks.
+
+How to use it:
+  Install the service:
+    autogit install
+
+  Start and enable:
+    systemctl --user daemon-reload
+    systemctl --user enable --now autogit.service
+
+  Check status:
+    systemctl --user status autogit.service
+
+  View logs:
+    journalctl --user -u autogit.service -f
+
+  Uninstall:
+    autogit uninstall
+
+
+================================================================================
+32. CLI COMMANDS REFERENCE
+================================================================================
+
+Main command:
+  autogit [--config <path>]
+    Starts the AutoGit daemon. Monitors editors and runs scheduled backups.
+
+Subcommands:
+  autogit install [--config <path>]
+    Installs AutoGit as a systemd user service.
+
+  autogit uninstall
+    Removes the AutoGit systemd user service.
+
+  autogit verify [--config <path>]
+    Verifies that backups for all configured repositories are recoverable.
+
+  autogit health [--config <path>]
+    Runs health checks on all configured repositories.
+
+  autogit queue [--config <path>] [list|pending|completed|failed|clear]
+    Manages the offline backup queue.
+
+  autogit restore [--config <path>] [list|file|dir|worktree] <repo> [args...]
+    Restores files or snapshots from backup branches.
+
+  autogit history [--config <path>] <repo> [flags]
+    Lists backup snapshot history with optional filtering.
+
+  autogit compare [--config <path>] <repo> <from-hash> <to-hash> [flags]
+    Compares two snapshots and shows differences.
+
+  autogit cleanup [--config <path>]
+    Cleans up completed queue entries.
+
+  autogit storage [--config <path>]
+    Analyzes disk space usage for backup data.
+
+Flags:
+  --config <path>
+    Path to the configuration file. If omitted, AutoGit searches for
+    config.yaml in the current directory and ~/.config/autogit/.
+
+
+================================================================================
+33. HOW TO USE AUTOGIT — END-TO-END WORKFLOW
+================================================================================
+
+Step 1: Install AutoGit
+  Build from source or download the binary:
+    go build -o autogit ./cmd/autogit
+    sudo mv autogit /usr/local/bin/
+
+Step 2: Create Configuration
+  Copy the example config:
+    cp config.example.yaml ~/.config/autogit/config.yaml
+
+  Edit the config file:
+    - Set interval (e.g., "5m")
+    - Add your repositories with their paths
+    - Choose backup mode ("commit" or "branch")
+    - List your editor process names
+    - Configure any optional features (notifications, power, queue, etc.)
+
+Step 3: Verify Setup
+  Run a health check:
+    autogit health
+
+  This confirms your repositories are valid and reachable.
+
+Step 4: Start AutoGit
+  Run in the foreground (for testing):
+    autogit
+
+  Or install as a service (for production):
+    autogit install
+    systemctl --user enable --now autogit.service
+
+Step 5: Open Your Editor
+  When you open a configured editor (e.g., GoLand, VS Code), AutoGit:
+  1. Detects the editor process
+  2. Runs SyncOnOpen (pulls latest remote commits)
+  3. Runs the first backup immediately
+  4. Continues backing up at the configured interval
+
+Step 6: Monitor
+  Check logs:
+    journalctl --user -u autogit.service -f
+
+  Or view notifications if enabled.
+
+Step 7: Verify Backups
+  Periodically verify your backups:
+    autogit verify
+
+  Or check storage usage:
+    autogit storage
+
+Step 8: Restore (if needed)
+  If you need to recover a file or snapshot:
+    autogit history /path/to/repo          # Find the snapshot
+    autogit restore file /path/to/repo <hash> <file> <dest>
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================

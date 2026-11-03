@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 )
 
 // DefaultBranchPrefix is the namespace of backup branches unless configured otherwise.
@@ -45,6 +44,11 @@ type backupNames struct {
 	local    string // hidden local ref holding the newest snapshot: refs/autogit/<machine>/<branch>
 	remote   string // branch on the remote: refs/heads/autogit/<machine>/<branch>
 	tracking string // local copy of that remote branch: refs/remotes/origin/autogit/<machine>/<branch>
+}
+
+// NewBackupNames constructs the backup ref names for a repository.
+func NewBackupNames(path string, opts Options) (backupNames, error) {
+	return newBackupNames(path, opts)
 }
 
 func newBackupNames(path string, opts Options) (backupNames, error) {
@@ -545,44 +549,50 @@ func PruneBackupBranch(path string, names backupNames, retention RetentionCfg) (
 		return 0, nil
 	}
 
-	// Determine which commits to keep.
-	now := time.Now().Unix()
-	var cutoff int64
-	if retention.MaxAge > 0 {
-		cutoff = now - (int64(retention.MaxAge) * 86400)
+	// Use the retention engine to determine which commits to keep.
+	keptHashes, protected, err := EvaluateRetention(path, names, retention)
+	if err != nil {
+		return 0, fmt.Errorf("evaluating retention: %w", err)
 	}
 
-	// Find the keep boundary: the first commit that should be removed.
-	// Commits are ordered newest-first, so we keep from index 0 up to keepCount-1.
-	keepCount := 0
-	for i, c := range commits {
-		ageOK := retention.MaxAge == 0 || c.date >= cutoff
-		countOK := retention.MaxCommits == 0 || (i+1) <= retention.MaxCommits
+	// Log protected snapshots that were kept due to branch ancestry.
+	if len(protected) > 0 {
+		log.Printf("[retention] %d snapshot(s) protected by branch ancestry", len(protected))
+	}
 
-		if ageOK && countOK {
-			keepCount = i + 1
-		} else {
-			break
+	// Build a set of kept hashes for fast lookup.
+	keptSet := make(map[string]bool)
+	for _, h := range keptHashes {
+		keptSet[h] = true
+	}
+
+	// Determine which commits to keep in order (newest-first).
+	var keptCommits []commitInfo
+	for _, c := range commits {
+		if keptSet[c.hash] {
+			keptCommits = append(keptCommits, c)
 		}
 	}
 
 	// Always keep at least one commit so the branch isn't empty.
-	if keepCount == 0 {
-		keepCount = 1
+	if len(keptCommits) == 0 {
+		keptCommits = []commitInfo{commits[0]}
 	}
 
-	pruned := len(commits) - keepCount
+	pruned := len(commits) - len(keptCommits)
 	if pruned <= 0 {
 		return 0, nil
 	}
 
 	// The oldest commit we're keeping.
-	oldestKept := commits[keepCount-1].hash
+	oldestKept := keptCommits[len(keptCommits)-1].hash
 
 	// Build a set of pruned commit hashes.
 	prunedHashes := make(map[string]bool)
-	for i := keepCount; i < len(commits); i++ {
-		prunedHashes[commits[i].hash] = true
+	for _, c := range commits {
+		if !keptSet[c.hash] {
+			prunedHashes[c.hash] = true
+		}
 	}
 
 	// Get the parents of the oldest kept commit.
@@ -626,6 +636,7 @@ func PruneBackupBranch(path string, names backupNames, retention RetentionCfg) (
 
 	// At least one parent is pruned. We need to recreate the oldest kept commit
 	// without the pruned parents, then rebuild the chain of kept commits on top.
+	keepCount := len(keptCommits)
 	return rebuildKeptChain(path, names, commits, keepCount, oldestKept, prunedHashes, pruned)
 }
 

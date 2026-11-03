@@ -6,7 +6,7 @@ AutoGit is a lightweight Go application that automates routine Git operations wh
 
 The goal is simple: reduce the chance of forgetting to commit and push your work before switching computers or ending a development session.
 
-> **Project status:** Working prototype. Two backup modes, a secrets guard, repository-state checks, timeouts and retries, editor-aware scheduling (including an opening and a closing backup), desktop notifications, backup branch retention, concurrency protection, and GitHub Actions CI are implemented and covered by automated tests, and have been exercised against real repositories. Review the limitations below before relying on AutoGit as your only backup solution.
+> **Project status:** Working prototype. Two backup modes, a secrets guard, repository-state checks, timeouts and retries, editor-aware scheduling (including an opening and a closing backup), desktop notifications, enhanced backup branch retention with calendar policies and per-repository settings, concurrency protection, an offline backup queue that survives restarts, backup verification, and GitHub Actions CI are implemented and covered by automated tests, and have been exercised against real repositories. Review the limitations below before relying on AutoGit as your only backup solution.
 
 ---
 
@@ -20,6 +20,7 @@ The goal is simple: reduce the chance of forgetting to commit and push your work
 - [Configuration](#configuration)
 - [Keeping Secrets Out of Backups](#keeping-secrets-out-of-backups)
 - [Usage](#usage)
+- [Backup Restore and Recovery](#backup-restore-and-recovery)
 - [Synchronization and Conflict Handling](#synchronization-and-conflict-handling)
 - [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
@@ -152,7 +153,98 @@ Shorter intervals provide more frequent checks but can result in more frequent c
 
 The first backup does not wait for a full interval. It runs as soon as a configured editor is detected.
 
-### 9. Editor-aware scheduling
+#### Scheduling policies
+
+By default, AutoGit backs up every tick regardless of whether anything changed. With a scheduling policy, you can make AutoGit back up only when repositories have active development, saving CPU, battery, and network resources.
+
+Each repository can use its own policy through the `schedule` block:
+
+```yaml
+repositories:
+  - path: "/path/to/project"
+    schedule:
+      policy: "smart"
+      interval: "5m"
+      activity_window: "2h"
+      safety_interval: "48h"
+```
+
+**Policies:**
+
+| Policy | Behavior |
+|--------|----------|
+| `"fixed"` (default) | Backs up on every tick — the original behavior |
+| `"smart"` | Backs up only when uncommitted changes are detected, with a safety fallback (`safety_interval`, default 24h) that forces a backup even when nothing changed |
+| `"hybrid"` | Like smart, but enforces a minimum time between backups (`min_interval`, default 1m) to throttle very active repositories |
+
+**Configuration parameters:**
+
+- `schedule.policy` — `"fixed"`, `"smart"`, or `"hybrid"`. When omitted, defaults to `"fixed"`.
+- `schedule.interval` — per-repository interval override. When omitted, the global `interval` is used.
+- `schedule.activity_window` — how far back to look for recent changes (default `1h`). Used by `smart` and `hybrid`.
+- `schedule.safety_interval` — maximum time between backups when nothing changed (default `24h`). Used by `smart` only.
+- `schedule.min_interval` — minimum time between backups (default `1m`). Used by `hybrid` only.
+
+**How it works:**
+
+The scheduler still ticks at the configured interval for every policy. The difference is **what happens on each tick** — the policy decides whether to actually run a backup or skip it.
+
+With `"smart"`, if a repository hasn't changed in days, the scheduler still ticks every 5 minutes, but the backup is skipped. It only runs when you actually made changes, or when the safety interval forces one.
+
+With `"hybrid"`, the same skip-when-nothing-changed behavior applies, but even a very active repository won't back up more often than `min_interval` allows. For example, with `interval: 30s` and `min_interval: 2m`, the repo won't back up more than once every 2 minutes.
+
+If you leave `schedule` off entirely, the repository uses the original fixed-interval behavior with the global `interval` setting.
+
+### 9. Battery-aware scheduling
+
+On a laptop, AutoGit can detect whether the computer is running on battery or external power, and automatically adjust its backup behavior to save battery life.
+
+Add a `power` section to your `config.yaml`:
+
+```yaml
+power:
+  battery_interval: "15m"
+  low_battery_percent: 20
+```
+
+**Configuration options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `battery_interval` | Backup interval when running on battery (e.g., `"15m"`, `"30m"`). Leave empty to use the normal interval on battery too. | Empty (uses normal interval) |
+| `low_battery_percent` | Battery percentage below which automatic backups are paused. Set to `0` to disable. | `0` (disabled) |
+
+**How it works:**
+
+- When you unplug and the battery starts discharging, AutoGit switches to the longer `battery_interval`. When you plug back in, it switches back to the normal interval.
+- When the battery drops below `low_battery_percent`, automatic backups are skipped entirely. Manual backups still work.
+- Transitions are detected automatically — no restart is needed.
+
+**Example configurations:**
+
+*Conservative — save maximum battery:*
+```yaml
+power:
+  battery_interval: "30m"
+  low_battery_percent: 15
+```
+
+*Balanced — moderate reduction on battery:*
+```yaml
+power:
+  battery_interval: "15m"
+  low_battery_percent: 20
+```
+
+*Interval only — no low-battery pause:*
+```yaml
+power:
+  battery_interval: "15m"
+```
+
+Battery-aware scheduling applies to repositories using the `smart` or `hybrid` scheduling policy. On systems without a battery (desktops), AutoGit falls back to always assuming AC power.
+
+### 10. Editor-aware scheduling
 
 AutoGit checks for configured editor processes every 5 seconds and enables scheduled backups while at least one configured editor is running.
 
@@ -177,7 +269,7 @@ Stopping AutoGit itself with `Ctrl+C` does not run a final backup, so that quitt
 
 This reduces unnecessary background activity when you are not working in a configured editor.
 
-### 10. Pull on open
+### 11. Pull on open
 
 When an editor opens, AutoGit first fetches your remote and brings in any commits that were pushed from another computer, before it looks at your own changes. You start working on the latest code, and your first push is not rejected because the remote moved on.
 
@@ -185,7 +277,7 @@ It only ever fast-forwards. It never creates a merge commit, rewrites your histo
 
 This is on by default. Turn it off with `sync.pull_on_open: false`. See [Pull on open](#pull-on-open).
 
-### 11. Resilient Git operations
+### 12. Resilient Git operations
 
 AutoGit is built to keep working unattended:
 
@@ -193,7 +285,7 @@ AutoGit is built to keep working unattended:
 - **No interactive prompts.** Git is run with `GIT_TERMINAL_PROMPT=0`, so a missing credential fails immediately instead of waiting for input that nobody is there to type.
 - **Retries.** Fetches and pushes are attempted up to 3 times, 2 seconds apart, when the failure looks temporary: for example a DNS failure, a connection that timed out or was reset, an unreachable network, or a 502, 503, or 504 response. Authentication failures, permission errors, a missing repository or remote, and rejected pushes are not retried, since trying again cannot fix them. A command that hit AutoGit's own timeout is not retried either; the next scheduled cycle is the retry.
 
-### 12. Multiple repository support
+### 13. Multiple repository support
 
 The configuration accepts a list of repository paths. AutoGit can therefore be configured to check multiple local Git repositories.
 
@@ -201,7 +293,7 @@ Each repository must exist and be a valid Git working tree.
 
 A failure or a skipped cycle in one repository does not stop the others.
 
-### 13. Configurable YAML settings
+### 14. Configurable YAML settings
 
 AutoGit uses a YAML configuration file to define the backup interval, repositories, commit message, backup mode, and editor processes.
 
@@ -209,7 +301,7 @@ This keeps common settings separate from the Go implementation.
 
 Use the `--config` flag to choose a file, or let AutoGit find `config.yaml` in the current directory or in `~/.config/autogit/`. See [Where AutoGit looks for its configuration](#where-autogit-looks-for-its-configuration).
 
-### 14. Error reporting
+### 15. Error reporting
 
 AutoGit reports operational failures encountered during Git commands, including failures while fetching, rebasing, or pushing.
 
@@ -217,7 +309,7 @@ It distinguishes a failure from a deliberate skip. A repository that is busy or 
 
 A failed operation is not the same as a successful backup. Review the logs and repository state when an error is reported.
 
-### 15. Desktop notifications
+### 16. Desktop notifications
 
 AutoGit can send desktop notifications with audible alerts for key events, so you do not need to watch the terminal log. When enabled, you receive a notification for:
 
@@ -238,9 +330,19 @@ notifications:
 
 Notifications use the `beeep` library, which calls `notify-send` on Linux, `osascript` on macOS, and Toast notifications on Windows.
 
-### 16. Backup branch retention
+### 17. Backup branch retention
 
-In branch mode, each backup adds a commit to the backup branch. Without retention, these branches grow indefinitely. Retention automatically prunes old snapshots by age and count, rewriting the branch history and force-pushing the result so old snapshots are removed from both local and remote.
+In branch mode, each backup adds a commit to the backup branch. Without retention, these branches grow indefinitely. Retention automatically prunes old snapshots, rewriting the branch history and force-pushing the result so old snapshots are removed from both local and remote.
+
+#### Retention rules
+
+Retention uses multiple rules that work together. A snapshot is **kept** if it passes **any** rule:
+
+- **`max_age`** — Keep snapshots newer than this many days.
+- **`max_commits`** — Keep the N most recent snapshots.
+- **`keep_daily`** — Keep the last snapshot of each of the last N days.
+- **`keep_weekly`** — Keep the last snapshot of each of the last N weeks (by ISO week).
+- **`keep_monthly`** — Keep the last snapshot of each of the last N months.
 
 ```yaml
 backup:
@@ -248,11 +350,53 @@ backup:
   retention:
     max_age: 30        # delete snapshots older than 30 days
     max_commits: 50    # keep at most 50 snapshots per branch
+    keep_daily: 7      # keep last snapshot of each of the last 7 days
+    keep_weekly: 4     # keep last snapshot of each of the last 4 weeks
+    keep_monthly: 12   # keep last snapshot of each of the last 12 months
 ```
 
-When both limits are set, a snapshot is pruned if it exceeds either one. At least one snapshot is always kept so the branch is never empty. Set both values to `0` or omit the `retention` section to disable pruning.
+At least one snapshot is always kept so the branch is never empty. Set all values to `0` or omit the `retention` section to disable pruning.
 
-### 17. Automated tests
+#### Per-repository retention
+
+Each repository can override the global retention policy. When a repository has a `retention` block, it replaces the global `backup.retention` entirely for that repository:
+
+```yaml
+repositories:
+  - path: "/path/to/important-project"
+    retention:
+      max_age: 90
+      max_commits: 100
+      keep_daily: 14
+      keep_weekly: 8
+      keep_monthly: 12
+```
+
+#### Protected branch safety
+
+Before pruning, AutoGit checks whether each snapshot is an ancestor of any local user branch (branches that are not backup branches). If a snapshot is reachable from a user branch, it is marked as **protected** and will never be pruned, regardless of the retention rules.
+
+#### Manual cleanup
+
+You can preview or execute cleanup at any time using the `cleanup` subcommand:
+
+```bash
+# Preview what would be pruned (default, safe)
+autogit cleanup
+
+# Preview for a specific repository
+autogit cleanup --repo /path/to/repo
+
+# Execute cleanup, removing pruned snapshots
+autogit cleanup --force
+
+# Execute cleanup for a specific repository
+autogit cleanup --repo /path/to/repo --force
+```
+
+The output shows each snapshot with its status: `keep`, `prune`, or `protected`.
+
+### 18. Automated tests
 
 The project includes tests for configuration, editor detection, Git operations, scheduling, and the editor-monitoring loop.
 
@@ -264,15 +408,70 @@ go test ./...
 
 The project has also been exercised against a real repository to test automatic commits, pushing local changes, retrieving remote changes, divergent histories, and rebase-conflict handling.
 
-### 18. Concurrency protection
+### 19. Concurrency protection
 
 If two AutoGit instances run at the same time — for example, a scheduled systemd service and a manual foreground run — they would normally race on the same repository, corrupting backup branches or creating conflicting commits. AutoGit uses an exclusive file lock (`flock`) inside each repository's `.git` directory so that only one instance can operate on a repository at a time. The second instance skips that repository and will retry on the next cycle.
 
 This protection covers both backup operations and the pull-on-open synchronization.
 
-### 19. Continuous integration
+### 20. Continuous integration
 
 A GitHub Actions workflow runs `go build`, `go vet`, and `go test -race` on every push and pull request, so broken code is caught before it reaches your branch.
+
+### 21. Offline backup queue
+
+When enabled, backup operations that fail due to network issues are stored locally in a SQLite database and automatically retried when connectivity returns. The queue persists across application restarts, so pending backups survive if AutoGit is stopped or crashes.
+
+Each queued entry records the repository path, commit hash, remote URL, status, retry count, and last error. Duplicate prevention uses the repository path and commit hash as a unique key: if the same commit is already queued, it is not added again.
+
+A background processor periodically checks for network availability and retries pending entries. When a backup succeeds normally, any matching queued entry is automatically cleared.
+
+To enable it, add this to `config.yaml`:
+
+```yaml
+offline_queue:
+  enabled: true
+  retry_delay: "1m"
+  max_retries: 10
+```
+
+Inspect the queue status at any time:
+
+```bash
+autogit queue
+```
+
+This shows counts of pending, completed, and failed operations, along with details for each.
+
+### 23. Backup verification
+
+A successful `git push` does not guarantee that a backup is recoverable later. The remote could lose objects, references could be accidentally deleted, or network issues could cause silent failures. Backup verification gives confidence that backups are actually present and intact.
+
+For each configured repository, verification runs five checks in sequence:
+
+1. **Remote reachability** — Runs `git fetch`. If the remote is unreachable (network down, repository deleted, authentication expired), verification stops early.
+2. **Backup reference exists** — Checks that the expected backup reference exists on the remote. In commit mode this is the current branch's upstream tracking ref. In branch mode this is the backup branch's tracking ref.
+3. **Commit hash comparison** — If an expected commit hash is known, it is compared with the remote commit hash. A mismatch means the backup was overwritten or corrupted.
+4. **Snapshot fetchability** — Validates that the commit object, its tree, and a sample of blob files are all accessible on the remote.
+5. **Corruption detection** — If any check fails, a human-readable issue is recorded.
+
+Verification can run manually via the CLI or automatically on a schedule:
+
+```bash
+autogit verify
+```
+
+To enable periodic verification, add this to `config.yaml`:
+
+```yaml
+verification:
+  enabled: true
+  interval: "24h"
+```
+
+When enabled, AutoGit runs verification automatically on the configured interval (default 24 hours), starting one minute after launch so the initial backup has time to complete. This runs independently of whether an editor is open.
+
+If any issue is found, a desktop notification is sent (if notifications are enabled). See [Verify backups](#verify-backups).
 
 ---
 
@@ -535,9 +734,18 @@ Replace the example repository path with the absolute path to your own local rep
 | `backup.prefix` | Branch mode only. Namespace of the backup branches. Default: `autogit`. |
 | `backup.machine` | Branch mode only. Name of this computer in the branch name. Default: the host name. |
 | `sync.pull_on_open` | `true` (default) fast-forwards each repository to its upstream when an editor opens. See [Pull on open](#pull-on-open). |
-| `backup.retention.max_age` | Branch mode only. Delete snapshots older than this many days. Zero means no age limit. See [Backup branch retention](#16-backup-branch-retention). |
-| `backup.retention.max_commits` | Branch mode only. Keep at most this many snapshots per branch. Zero means no count limit. See [Backup branch retention](#16-backup-branch-retention). |
-| `notifications.enabled` | `false` (default). Set to `true` to enable desktop notifications with audible alerts. See [Desktop notifications](#15-desktop-notifications). |
+| `backup.retention.max_age` | Branch mode only. Delete snapshots older than this many days. Zero means no age limit. See [Backup branch retention](#17-backup-branch-retention). |
+| `backup.retention.max_commits` | Branch mode only. Keep at most this many snapshots per branch. Zero means no count limit. See [Backup branch retention](#17-backup-branch-retention). |
+| `backup.retention.keep_daily` | Branch mode only. Keep the last snapshot of each of the last N days. See [Backup branch retention](#17-backup-branch-retention). |
+| `backup.retention.keep_weekly` | Branch mode only. Keep the last snapshot of each of the last N weeks. See [Backup branch retention](#17-backup-branch-retention). |
+| `backup.retention.keep_monthly` | Branch mode only. Keep the last snapshot of each of the last N months. See [Backup branch retention](#17-backup-branch-retention). |
+| `notifications.enabled` | `false` (default). Set to `true` to enable desktop notifications with audible alerts. See [Desktop notifications](#16-desktop-notifications). |
+| `offline_queue.enabled` | `false` (default). Set to `true` to persist failed backups and retry them when the network returns. See [Offline backup queue](#21-offline-backup-queue). |
+| `offline_queue.path` | Directory for the queue database. Default: `~/.config/autogit`. |
+| `offline_queue.retry_delay` | Wait time between retry cycles. Default: `30s`. |
+| `offline_queue.max_retries` | Maximum retry attempts before marking an entry as failed. Default: `5`. |
+| `verification.enabled` | `false` (default). Set to `true` to enable periodic backup verification. See [Backup verification](#23-backup-verification). |
+| `verification.interval` | Time between verification runs. Default: `24h`. Accepts any Go duration string (e.g. `12h`, `168h` for weekly). |
 
 Invalid `backup` settings stop AutoGit at startup with a message naming the setting.
 | `editors` | Process names used to determine whether scheduled backups should run. |
@@ -585,7 +793,7 @@ git diff HEAD origin/autogit/my-laptop/main
 git checkout origin/autogit/my-laptop/main -- path/to/file
 ```
 
-If [retention](#16-backup-branch-retention) is configured, old snapshots are automatically pruned by age and count. Without retention, backup branches grow with every change.
+If [retention](#17-backup-branch-retention) is configured, old snapshots are automatically pruned by age and count. Without retention, backup branches grow with every change.
 
 Deleting the branch on the remote is not enough: AutoGit keeps its own record of the newest snapshot and recreates the branch, with its full history, on the next change. To start over, delete the remote branch and AutoGit's two local records of it:
 
@@ -845,6 +1053,228 @@ AutoGit also keeps its own record of the newest snapshot on your computer. List 
 ```bash
 git for-each-ref refs/autogit
 ```
+
+### Offline backup queue
+
+When the network is unavailable, AutoGit can preserve pending backup operations and retry them automatically when connectivity returns. This is useful when working with unreliable internet connections — for example, on a laptop during travel.
+
+**How it works:**
+
+1. When a backup push fails with a network error and the queue is enabled, the operation is stored in a local SQLite database.
+2. A background process periodically checks whether the network is available.
+3. When connectivity returns, pending operations are retried automatically.
+4. If a backup succeeds normally (not from the queue), any matching queued entry is cleared.
+5. After the configured number of failed retries, an entry is marked as permanently failed.
+
+**Enabling the queue:**
+
+Add the following to `config.yaml`:
+
+```yaml
+offline_queue:
+  enabled: true
+  retry_delay: "1m"
+  max_retries: 10
+```
+
+The queue database is stored at `~/.config/autogit/queue.db` by default. You can change the directory with `offline_queue.path`.
+
+**Checking queue status:**
+
+```bash
+autogit queue
+```
+
+Example output:
+
+```
+AutoGit Offline Backup Queue Status
+====================================
+
+Pending:   2
+Completed: 5
+Failed:    0
+
+Pending backups:
+  /home/user/projects/my-app                a1b2c3d4  (retry: 1)
+  /home/user/projects/website                e5f6a7b8  (retry: 0)
+
+Recently completed:
+  /home/user/projects/my-app                9c8d7e6f  (completed: 2026-11-03 10:15:22)
+```
+
+**Duplicate prevention:**
+
+The queue uses the repository path and commit hash as a unique key. If the same commit is already queued (pending or retrying), it is not added again. This prevents uploading the same snapshot multiple times.
+
+### Verify backups
+
+Run `autogit verify` to check that all configured repositories have valid, recoverable backups on their remotes:
+
+```bash
+autogit verify
+```
+
+Example output:
+
+```
+AutoGit Backup Verification
+=============================
+
+/home/user/projects/my-app: ✓ OK
+  Remote reachable: yes
+  Backup reference: exists
+  Commit hash: matches
+  Snapshot fetchable: yes
+
+/home/user/projects/website: ✗ FAILED
+  Remote reachable: yes
+  Backup reference: missing
+  Issues:
+    - backup reference does not exist on the remote
+```
+
+For each repository, verification checks:
+
+- **Remote reachability** — Can AutoGit contact the remote?
+- **Backup reference** — Does the expected backup reference exist on the remote?
+- **Commit hash** — If an expected hash is known, does it match the remote?
+- **Snapshot fetchability** — Are the commit, tree, and blob objects accessible?
+
+If any issue is found, a desktop notification is sent (if notifications are enabled).
+
+To run verification automatically, enable it in `config.yaml`:
+
+```yaml
+verification:
+  enabled: true
+  interval: "24h"
+```
+
+AutoGit will then verify all repositories on the configured schedule, independently of whether an editor is open.
+
+### Restore from backups
+
+When you need to recover lost work, `autogit restore` lets you browse and restore from previous backup snapshots without manually searching through Git history. This works with **branch mode** backups stored on `autogit/<machine>/<branch>`.
+
+**List available snapshots:**
+
+```bash
+autogit restore --op list
+```
+
+This shows all snapshots across all configured repositories, sorted newest-first, with the commit hash, date, originating machine, branch, and commit message. Filter by machine or branch:
+
+```bash
+autogit restore --op list --machine mylaptop --branch main
+```
+
+**Preview changes in a snapshot:**
+
+Before restoring, see what files differ between a snapshot and your current working tree:
+
+```bash
+autogit restore --op show --hash abc1234 --repo /path/to/repo
+```
+
+**Compare two snapshots:**
+
+See what changed between two backup snapshots:
+
+```bash
+autogit restore --op diff --from abc1234 --to def5678 --repo /path/to/repo
+```
+
+Or compare a snapshot against your current working tree:
+
+```bash
+autogit restore --op diff --from abc1234 --to WORKTREE --repo /path/to/repo
+```
+
+**Restore a single file:**
+
+Extract one file from a snapshot without affecting the rest of your working tree:
+
+```bash
+autogit restore --op file --hash abc1234 --file src/main.go --dest ./restored/main.go --repo /path/to/repo
+```
+
+**Restore a complete snapshot to a directory:**
+
+The safest way to inspect a full snapshot is to restore it to a separate directory:
+
+```bash
+autogit restore --op restore --hash abc1234 --dir ./snapshot-abc1234 --repo /path/to/repo
+```
+
+This creates `./snapshot-abc1234/` with all files from that snapshot, with no Git metadata.
+
+**Restore a complete snapshot into the working tree:**
+
+To overwrite your current working tree with a snapshot, use `--force`. AutoGit will preview the changes first:
+
+```bash
+autogit restore --op restore --hash abc1234 --force --repo /path/to/repo
+```
+
+This updates tracked files in place without moving HEAD. Untracked files are not affected.
+
+### Cleanup backup snapshots
+
+Use `autogit cleanup` to preview or execute backup branch cleanup. By default it runs in dry-run mode, showing which snapshots would be kept, pruned, or protected:
+
+```bash
+# Preview cleanup (default, safe)
+autogit cleanup
+
+# Preview for a specific repository
+autogit cleanup --repo /path/to/repo
+
+# Execute cleanup, removing pruned snapshots
+autogit cleanup --force
+
+# Execute cleanup for a specific repository
+autogit cleanup --repo /path/to/repo --force
+```
+
+Example output:
+
+```
+/home/user/projects/my-app (15 snapshots)
+------------------------------------------------------------------------------------------
+Hash          Date                 Status
+------------------------------------------------------------------------------------------
+a1b2c3d4e5f6  2026-11-03 14:30     keep
+b2c3d4e5f6a1  2026-11-03 10:15     keep
+c3d4e5f6a1b2  2026-11-02 18:45     keep
+d4e5f6a1b2c3  2026-10-15 09:20     protected
+e5f6a1b2c3d4  2026-09-01 12:00     prune
+
+Summary: 3 kept, 11 pruned, 1 protected
+
+--- Dry run: no changes made ---
+
+Total: 15 snapshots, 3 kept, 11 pruned, 1 protected
+```
+
+Snapshots marked `protected` are ancestors of active user branches and will never be pruned.
+
+**Common flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--op` | Operation: `list`, `show`, `diff`, `file`, or `restore` |
+| `--hash` | Snapshot commit hash |
+| `--from` | Source snapshot hash (for `diff`) |
+| `--to` | Target snapshot hash or `WORKTREE` (for `diff`) |
+| `--file` | File path within the snapshot (for `file`) |
+| `--dest` | Destination path for restored file (for `file`) |
+| `--dir` | Destination directory for full restore |
+| `--force` | Restore into the current working tree |
+| `--machine` | Filter by machine name (for `list`) |
+| `--branch` | Filter by branch name (for `list`) |
+| `--repo` | Target a specific repository path |
+| `--config` | Path to the configuration file |
 
 ### Stop AutoGit
 
@@ -1286,7 +1716,7 @@ Never rely solely on a global Git ignore file for secrets. Review repository-lev
 
 AutoGit uses your Git repository and remote. It does not independently create a versioned offline archive or guarantee recovery if both the local repository and remote hosting account are lost or compromised.
 
-In branch mode, [backup branch retention](#16-backup-branch-retention) can automatically prune old snapshots by age and count. Without it, branches grow indefinitely.
+In branch mode, [backup branch retention](#17-backup-branch-retention) can automatically prune old snapshots by age, count, and calendar policies. It also protects snapshots that are ancestors of active user branches. Use `autogit cleanup` to preview or execute cleanup manually.
 
 Maintain independent backups for important work.
 
@@ -1396,12 +1826,25 @@ auto-git/
 │   │   ├── retry_test.go
 │   │   ├── snapshot.go
 │   │   ├── snapshot_test.go
+│   │   ├── restore.go
+│   │   ├── restore_test.go
+│   │   ├── verify.go
+│   │   ├── verify_test.go
+│   │   ├── health.go
 │   │   ├── state.go
 │   │   ├── state_test.go
 │   │   └── sync_test.go
 │   ├── notify/
 │   │   ├── notify.go
 │   │   └── notify_test.go
+│   ├── power/
+│   │   ├── power.go
+│   │   └── power_test.go
+│   ├── queue/
+│   │   ├── queue.go
+│   │   ├── queue_test.go
+│   │   ├── processor.go
+│   │   └── processor_test.go
 │   └── scheduler/
 │       ├── scheduler.go
 │       └── scheduler_test.go
@@ -1428,6 +1871,9 @@ Some files may differ as the project evolves. This layout describes the current 
 - `internal/git`: everything that touches a repository.
     - `git.go`: running Git with timeouts, the backup modes, and the commit-mode backup.
     - `snapshot.go`: the branch-mode backup.
+    - `restore.go`: listing, diffing, and restoring from backup snapshots.
+    - `verify.go`: checking that backups are recoverable on the remote.
+    - `health.go`: repository health checks (path, remote, authentication, sync status).
     - `guard.go`: the secrets guard and the `.autogit-allow` list.
     - `message.go`: commit message templates and the summary of what changed.
     - `pull.go`: bringing in new remote commits when an editor opens.
@@ -1435,6 +1881,8 @@ Some files may differ as the project evolves. This layout describes the current 
     - `retry.go`: retrying temporary network failures.
     - `lock.go`: exclusive per-repository file locks to prevent concurrent AutoGit instances from racing.
 - `internal/notify`: desktop notifications with audible alerts using the `beeep` library.
+- `internal/power`: battery state detection for power-aware scheduling.
+- `internal/queue`: offline backup queue that survives restarts.
 - `internal/scheduler`: scheduled backup execution and lifecycle management.
 
 ---

@@ -13,8 +13,38 @@
 interval: "1m"
 
 # Absolute paths of the Git repositories to back up.
+#
+# Each repository can have its own scheduling policy and interval.
+# When no schedule is specified the global interval and the "fixed"
+# policy (backup on every tick) are used.
 repositories:
   - path: "/path/to/your/repository"
+
+  # Example: use smart scheduling for a repository that changes rarely.
+  # - path: "/path/to/rarely-changed"
+  #   schedule:
+  #     policy: "smart"
+  #     interval: "5m"
+  #     activity_window: "2h"
+  #     safety_interval: "48h"
+
+  # Example: use hybrid scheduling for a very active repository.
+  # - path: "/path/to/very-active"
+  #   schedule:
+  #     policy: "hybrid"
+  #     interval: "30s"
+  #     min_interval: "2m"
+  #     activity_window: "30m"
+
+  # Example: per-repository retention policy. When set, it overrides the
+  # global backup.retention for this repository.
+  # - path: "/path/to/important-project"
+  #   retention:
+  #     max_age: 90
+  #     max_commits: 100
+  #     keep_daily: 14
+  #     keep_weekly: 8
+  #     keep_monthly: 12
 
 # The commit message. It can describe what each backup contains, so your history
 # is readable instead of a column of identical lines. Placeholders:
@@ -50,12 +80,26 @@ backup:
   # max_age: 30                # delete snapshots older than 30 days
   # max_commits: 50            # keep at most 50 snapshots per branch
   #
-  # When both are set, a snapshot is pruned if it exceeds either limit.
+  # Calendar-based retention keeps the last snapshot of each period:
+  #
+  # keep_daily: 7              # keep last snapshot of each of the last 7 days
+  # keep_weekly: 4             # keep last snapshot of each of the last 4 weeks
+  # keep_monthly: 12           # keep last snapshot of each of the last 12 months
+  #
+  # A snapshot is kept if it passes ANY rule (age, count, or calendar).
+  # Snapshots that are ancestors of active user branches are never pruned.
+  #
   # Pruning rewrites the backup branch history and force-pushes the result,
   # so old snapshots are removed from both local and remote.
+  #
+  # You can preview cleanup with: autogit cleanup
+  # To execute: autogit cleanup --force
   retention:
     max_age: 30
     max_commits: 50
+    # keep_daily: 7
+    # keep_weekly: 4
+    # keep_monthly: 12
 
 # When an editor opens, bring in anything pushed from another computer before
 # the first backup, so you start from the latest code. This only fast-forwards:
@@ -68,12 +112,29 @@ sync:
 # When enabled AutoGit pops up a notification and plays a sound for:
 #   - Successful backups (push completed)
 #   - Failed backups (push error, merge conflict)
-#   - Skipped repositories (locked by another process)
-#   - Diverged or blocked pulls (new commits conflict with local work)
+#   - Repositories requiring manual intervention (merge conflicts, locked repos)
+#   - Pending backups synchronized after connectivity returns
+#   - Backup branches that have diverged from their target
 #
 # Notifications are off by default. Set to true to turn them on.
+#
+# You can also control each event type individually under `events`.
+# An omitted key inherits the global `enabled` flag.  For example, to
+# receive only failure notifications:
+#
+#   notifications:
+#     enabled: false
+#     events:
+#       backup_failure: true
+#
 notifications:
   enabled: false
+  # events:
+  #   backup_success: true
+  #   backup_failure: true
+  #   manual_intervention: true
+  #   queue_sync: true
+  #   branch_diverged: true
 
 # Process names that mean "an editor is open". Each must match what
 # `pgrep -x <name>` finds on your system.
@@ -86,3 +147,127 @@ editors:
   - vim
   - zed
   - cursor
+
+# ---------------------------------------------------------------------------
+# Scheduling policies — how AutoGit decides when to back up each repository.
+#
+# Set schedule.policy on a repository to choose its strategy. The global
+# interval still applies unless you override it with schedule.interval.
+#
+#   "fixed"   (default) Backs up on every tick, the original behavior.
+#
+#   "smart"   Backs up only when the repository has uncommitted changes.
+#             If nothing changes for a long time, a safety backup fires
+#             after schedule.safety_interval (default 24h) to ensure the
+#             repository is never left unprotected.
+#
+#             schedule.activity_window controls how far back AutoGit looks
+#             for recent changes (default 1h). A repository with changes
+#             within this window is considered active.
+#
+#   "hybrid"  Like "smart", but enforces a minimum time between backups
+#             (schedule.min_interval, default 1m). This prevents very
+#             active repositories from being backed up on every single
+#             tick, saving CPU and network bandwidth.
+#
+# Smart scheduling saves resources: when a repository has not changed,
+# AutoGit skips the Git operations (add, commit, push) for that tick.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Battery-aware scheduling — reduce power consumption on laptops.
+#
+# When configured, AutoGit detects whether the computer is running on battery
+# or external power and adjusts its behavior accordingly.
+#
+#   battery_interval     Override the backup interval when on battery.
+#                        For example, "5m" while plugged in and "15m" on battery.
+#                        Leave empty to use the normal interval on battery too.
+#
+#   low_battery_percent  Pause automatic backups when the battery drops below
+#                        this percentage. Manual backups still work. Set to 0
+#                        to disable (the default).
+#
+# Example:
+#
+# power:
+#   battery_interval: "15m"
+#   low_battery_percent: 20
+#
+# This keeps AutoGit practical to leave running continuously on a laptop
+# without causing noticeable battery drain.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Backup verification — confirm that backups are recoverable.
+#
+# A successful Git push does not guarantee that a backup can be recovered later.
+# Verification gives you greater confidence by checking that the backup reference
+# exists on the remote, the commit hash matches, and the snapshot can be fetched.
+#
+#   enabled    Turn on periodic verification. When false (the default),
+#              verification only runs when you explicitly request it via
+#              the CLI: `autogit verify`.
+#
+#   interval   How often to run verification when enabled. Defaults to 24h.
+#
+# Example:
+#
+# verification:
+#   enabled: true
+#   interval: "12h"
+#
+# Verification performs these checks for each repository:
+#   1. Fetches the latest refs from the remote.
+#   2. Verifies the expected backup reference exists on the remote.
+#   3. Compares the commit hash with the remote backup commit.
+#   4. Verifies the snapshot can be fetched (tree objects are accessible).
+#   5. Detects missing or corrupted backup references.
+#
+# Verification failures are reported separately from backup failures,
+# so you can distinguish between "the push failed" and "the backup is
+# on the remote but cannot be recovered".
+#
+# You can also run verification manually at any time:
+#
+#   autogit verify
+#
+# This checks all configured repositories and prints a status report.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Offline backup queue — preserve pending backups when the network is down.
+#
+# When enabled, backup operations that fail due to network issues are stored
+# locally in a SQLite database and automatically retried when connectivity
+# returns. The queue persists across application restarts, so pending backups
+# survive if AutoGit is stopped or crashes.
+#
+#   enabled        Turn on the offline queue. When false (the default),
+#                  failed backups are logged but not retried later.
+#
+#   path           Directory where the queue database is stored.
+#                  Defaults to ~/.config/autogit/queue.db.
+#
+#   retry_delay    How long to wait between retry cycles. Defaults to 30s.
+#
+#   max_retries    Maximum number of retry attempts before marking an entry
+#                  as permanently failed. Defaults to 5.
+#
+# Example:
+#
+# offline_queue:
+#   enabled: true
+#   retry_delay: "1m"
+#   max_retries: 10
+#
+# The queue prevents duplicate uploads: if the same commit hash is already
+# queued (pending or retrying), it is not added again. Once a backup succeeds,
+# any matching queued entry is automatically marked as completed.
+#
+# You can inspect the queue status at any time:
+#
+#   autogit queue
+#
+# This shows pending, completed, and failed backup operations.
+# ---------------------------------------------------------------------------
